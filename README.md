@@ -1,3 +1,8 @@
+uicli:
+![Uploading image.png…]()
+
+
+
 # WinDbgLite Functional Code Annotations
 
 This document explains the functional structure of the project and the key execution paths for maintenance and extension.
