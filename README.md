@@ -3,6 +3,7 @@ uicli:
 
 <img width="1218" height="762" alt="image" src="https://github.com/user-attachments/assets/24b59b1c-9fee-4077-b945-ab4ec75d8d01" />
 
+<img width="1831" height="882" alt="image" src="https://github.com/user-attachments/assets/3ed66497-ec29-4bbb-812d-48857a31e096" />
 
 
 # WinDbgLite Functional Code Annotations
