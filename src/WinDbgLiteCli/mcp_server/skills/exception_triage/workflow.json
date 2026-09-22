@@ -1,0 +1,58 @@
+{
+  "name": "exception_triage",
+  "description": "Read-only triage for an exception stop.",
+  "risk": "read-only",
+  "readOnly": true,
+  "stopOnError": false,
+  "autoTriggers": [
+    "exception stop",
+    "second chance exception",
+    "first chance exception"
+  ],
+  "parameterDefaults": {
+    "threadIndex": 0,
+    "maxFrames": 12
+  },
+  "steps": [
+    {
+      "tool": "wdbl_stop_info",
+      "request": {
+        "cmd": "stop_info"
+      }
+    },
+    {
+      "tool": "wdbl_exception",
+      "request": {
+        "cmd": "execute",
+        "command": "exception"
+      }
+    },
+    {
+      "tool": "wdbl_registers",
+      "request": {
+        "cmd": "registers",
+        "index": "$threadIndex"
+      }
+    },
+    {
+      "tool": "wdbl_stack",
+      "request": {
+        "cmd": "stack",
+        "threadIndex": "$threadIndex",
+        "maxFrames": "$maxFrames"
+      }
+    },
+    {
+      "tool": "wdbl_modules",
+      "request": {
+        "cmd": "modules"
+      }
+    },
+    {
+      "tool": "wdbl_breakpoints",
+      "request": {
+        "cmd": "breakpoints"
+      }
+    }
+  ]
+}

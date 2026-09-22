@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "debugFeatures": [
+    {
+      "name": "veh_register_handler",
+      "category": "veh_seh",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Vectored exception handler registration",
+      "pattern": {
+        "keywords": ["addvectoredexceptionhandler", "rtladdvectoredexceptionhandler", "removevectoredexceptionhandler"],
+        "mnemonics": ["call"]
+      },
+      "evidence": {
+        "notes": "VEH registration changes first-chance exception routing and can affect breakpoint handling."
+      },
+      "action": {
+        "commands": ["pc rip 160", "u rip 80", "k 16"],
+        "skill": ""
+      },
+      "confidence": 0.84,
+      "notes": "seed json"
+    },
+    {
+      "name": "seh_dispatch_unwind",
+      "category": "veh_seh",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "SEH dispatch/unwind path",
+      "pattern": {
+        "keywords": ["rtldispatchexception", "rtlunwind", "kiuserexceptiondispatcher", "exception_continue_execution"],
+        "mnemonics": ["call", "jmp"]
+      },
+      "evidence": {
+        "notes": "Exception dispatcher and unwind helpers identify SEH/VEH flow."
+      },
+      "action": {
+        "commands": ["k 24", "r", "pc rip 160"],
+        "skill": "exception_triage"
+      },
+      "confidence": 0.78,
+      "notes": "seed json"
+    },
+    {
+      "name": "software_breakpoint_int3",
+      "category": "veh_seh",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Software breakpoint INT3 handling path",
+      "pattern": {
+        "keywords": ["int3", "0xcc", "exception_breakpoint", "80000003"],
+        "mnemonics": ["int3"]
+      },
+      "evidence": {
+        "notes": "INT3 must be consumed by a debugger/VEH handler or the process will terminate."
+      },
+      "action": {
+        "commands": ["r", "k 16", "pc rip 96"],
+        "skill": "exception_triage"
+      },
+      "confidence": 0.86,
+      "notes": "seed json"
+    }
+  ]
+}

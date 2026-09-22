@@ -1,0 +1,53 @@
+{
+  "name": "breakpoint_hit_triage",
+  "description": "Read-only triage after a breakpoint hit.",
+  "risk": "read-only",
+  "readOnly": true,
+  "stopOnError": false,
+  "autoTriggers": [
+    "breakpoint hit",
+    "hardware breakpoint hit",
+    "memory breakpoint hit"
+  ],
+  "parameterDefaults": {
+    "threadIndex": 0,
+    "maxFrames": 8,
+    "disasmCount": 12
+  },
+  "steps": [
+    {
+      "tool": "wdbl_stop_info",
+      "request": {
+        "cmd": "stop_info"
+      }
+    },
+    {
+      "tool": "wdbl_breakpoints",
+      "request": {
+        "cmd": "breakpoints"
+      }
+    },
+    {
+      "tool": "wdbl_registers",
+      "request": {
+        "cmd": "registers",
+        "index": "$threadIndex"
+      }
+    },
+    {
+      "tool": "wdbl_stack",
+      "request": {
+        "cmd": "stack",
+        "threadIndex": "$threadIndex",
+        "maxFrames": "$maxFrames"
+      }
+    },
+    {
+      "tool": "wdbl_disasm",
+      "request": {
+        "cmd": "execute",
+        "command": "u rip $disasmCount"
+      }
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "name": "access_violation_triage",
+  "description": "Read-only triage for access violation stops.",
+  "risk": "read-only",
+  "readOnly": true,
+  "stopOnError": false,
+  "autoTriggers": [
+    "0xC0000005",
+    "access violation"
+  ],
+  "parameterDefaults": {
+    "threadIndex": 0,
+    "maxFrames": 12,
+    "disasmCount": 16
+  },
+  "steps": [
+    {
+      "tool": "wdbl_stop_info",
+      "request": {
+        "cmd": "stop_info"
+      }
+    },
+    {
+      "tool": "wdbl_exception",
+      "request": {
+        "cmd": "execute",
+        "command": "exception"
+      }
+    },
+    {
+      "tool": "wdbl_registers",
+      "request": {
+        "cmd": "registers",
+        "index": "$threadIndex"
+      }
+    },
+    {
+      "tool": "wdbl_stack",
+      "request": {
+        "cmd": "stack",
+        "threadIndex": "$threadIndex",
+        "maxFrames": "$maxFrames"
+      }
+    },
+    {
+      "tool": "wdbl_memory_map",
+      "request": {
+        "cmd": "execute",
+        "command": "vmmap"
+      }
+    },
+    {
+      "tool": "wdbl_disasm",
+      "request": {
+        "cmd": "execute",
+        "command": "u rip $disasmCount"
+      }
+    }
+  ]
+}

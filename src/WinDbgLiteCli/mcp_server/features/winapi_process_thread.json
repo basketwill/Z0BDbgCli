@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "debugFeatures": [
+    {
+      "name": "winapi_process_create",
+      "category": "winapi_process_thread",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Windows process creation path",
+      "pattern": {
+        "keywords": ["createprocessw", "createprocessa", "ntcreateuserprocess"],
+        "mnemonics": ["call"]
+      },
+      "evidence": {
+        "notes": "Process creation APIs often precede injection, child process launch, or persistence behavior."
+      },
+      "action": {
+        "commands": ["r", "pc rip 160", "du rdx", "du rcx"],
+        "skill": ""
+      },
+      "confidence": 0.8,
+      "notes": "seed json"
+    },
+    {
+      "name": "winapi_remote_thread_injection",
+      "category": "winapi_process_thread",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Remote thread or APC injection candidate",
+      "pattern": {
+        "keywords": ["createremotethread", "ntcreatethreadex", "queueuserapc", "writeprocessmemory", "virtualallocex"],
+        "mnemonics": ["call"]
+      },
+      "evidence": {
+        "notes": "Allocation/write/thread or APC APIs are common remote execution building blocks."
+      },
+      "action": {
+        "commands": ["r", "pc rip 192", "k 16"],
+        "skill": ""
+      },
+      "confidence": 0.82,
+      "notes": "seed json"
+    },
+    {
+      "name": "winapi_thread_local_thread_create",
+      "category": "winapi_process_thread",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Local thread creation path",
+      "pattern": {
+        "keywords": ["createthread", "_beginthreadex", "rtlcreatethread"],
+        "mnemonics": ["call"]
+      },
+      "evidence": {
+        "notes": "Thread creation is useful for separating worker/bootstrap behavior."
+      },
+      "action": {
+        "commands": ["r", "pc rip 128", "k 16"],
+        "skill": ""
+      },
+      "confidence": 0.74,
+      "notes": "seed json"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "autocaptureEnabled": true,
+  "autoTriageOnEvent": false,
+  "autoLlmOnEvent": false,
+  "auditToolCalls": true
+}

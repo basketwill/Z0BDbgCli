@@ -1,0 +1,141 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "VS2010: Build WinDbgLiteWin32UI (Debug|Win32)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\BuildVS2010\\build.bat",
+      "args": [
+        "Debug",
+        "Win32",
+        "v100",
+        "WinDbgLiteWin32UI"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": [
+        "$msCompile"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "VS2010: Build WinDbgLite (Debug|Win32)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\BuildVS2010\\build.bat",
+      "args": [
+        "Debug",
+        "Win32",
+        "v100",
+        "WinDbgLite"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$msCompile"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "VS2010: Build Solution (Debug|Win32)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\BuildVS2010\\build.bat",
+      "args": [
+        "Debug",
+        "Win32",
+        "v100",
+        "Build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$msCompile"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "VS2010: Build Solution (Release|x64)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\BuildVS2010\\build.bat",
+      "args": [
+        "Release",
+        "x64",
+        "v100",
+        "Build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$msCompile"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "VS2010: Rebuild Solution (Debug|Win32)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\BuildVS2010\\build.bat",
+      "args": [
+        "Debug",
+        "Win32",
+        "v100",
+        "Rebuild"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$msCompile"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "VS2010: Clean Solution (Debug|Win32)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\BuildVS2010\\build.bat",
+      "args": [
+        "Debug",
+        "Win32",
+        "v100",
+        "Clean"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$msCompile"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ]
+}

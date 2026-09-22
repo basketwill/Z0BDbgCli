@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "debugFeatures": [
+    {
+      "name": "winapi_file_open_create",
+      "category": "winapi_file",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Windows file open/create path",
+      "pattern": {
+        "keywords": ["createfilew", "createfilea", "ntcreatefile", "zwcreatefile"],
+        "mnemonics": ["call"]
+      },
+      "evidence": {
+        "notes": "CreateFile/NtCreateFile is the main Windows file open/create API path."
+      },
+      "action": {
+        "commands": ["r", "pc rip 128", "du rcx", "da rcx"],
+        "skill": ""
+      },
+      "confidence": 0.82,
+      "notes": "seed json"
+    },
+    {
+      "name": "winapi_file_read_write",
+      "category": "winapi_file",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Windows file read/write path",
+      "pattern": {
+        "keywords": ["readfile", "writefile", "ntreadfile", "ntwritefile"],
+        "mnemonics": ["call"]
+      },
+      "evidence": {
+        "notes": "ReadFile/WriteFile and native variants identify file I/O."
+      },
+      "action": {
+        "commands": ["r", "pc rip 128", "db rdx L80"],
+        "skill": ""
+      },
+      "confidence": 0.78,
+      "notes": "seed json"
+    }
+  ]
+}

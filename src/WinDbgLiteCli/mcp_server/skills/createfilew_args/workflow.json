@@ -1,0 +1,48 @@
+{
+  "name": "createfilew_args",
+  "description": "Inspect x64 CreateFileW call context and lpFileName argument.",
+  "risk": "read-only",
+  "readOnly": true,
+  "stopOnError": false,
+  "autoTriggers": [
+    "CreateFileW breakpoint",
+    "KERNELBASE.dll!CreateFileW",
+    "KERNEL32.dll!CreateFileW"
+  ],
+  "parameterDefaults": {
+    "threadIndex": 0,
+    "maxFrames": 8,
+    "fileNameAddress": "rcx",
+    "stringBytes": 512
+  },
+  "steps": [
+    {
+      "tool": "wdbl_stop_info",
+      "request": {
+        "cmd": "stop_info"
+      }
+    },
+    {
+      "tool": "wdbl_registers",
+      "request": {
+        "cmd": "registers",
+        "index": "$threadIndex"
+      }
+    },
+    {
+      "tool": "wdbl_stack",
+      "request": {
+        "cmd": "stack",
+        "threadIndex": "$threadIndex",
+        "maxFrames": "$maxFrames"
+      }
+    },
+    {
+      "tool": "wdbl_createfilew_filename",
+      "request": {
+        "cmd": "execute",
+        "command": "da $fileNameAddress $stringBytes"
+      }
+    }
+  ]
+}

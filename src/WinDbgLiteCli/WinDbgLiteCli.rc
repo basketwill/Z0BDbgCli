@@ -1,0 +1,4 @@
+#include "WinDbgLiteCliResource.h"
+
+IDI_APP_ICON ICON "console.ico"
+IDI_LEFT_ICON ICON "lefticon.ico"

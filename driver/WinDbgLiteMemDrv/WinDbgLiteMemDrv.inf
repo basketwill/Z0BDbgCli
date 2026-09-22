@@ -1,0 +1,46 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = 05/23/2026,1.0.0.0
+CatalogFile = WinDbgLiteMemDrv.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+WinDbgLiteMemDrv.sys = 1
+
+[Manufacturer]
+%ProviderName% = Standard,NTamd64.10.0
+
+[Standard.NTamd64.10.0]
+%DeviceDesc% = Install, Root\WinDbgLiteMemDrv
+
+[Install]
+CopyFiles = DriverCopyFiles
+
+[Install.Services]
+AddService = WinDbgLiteMemDrv, 0x00000002, ServiceInstall
+
+[ServiceInstall]
+DisplayName    = %ServiceDisplayName%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\WinDbgLiteMemDrv.sys
+
+[DriverCopyFiles]
+WinDbgLiteMemDrv.sys
+
+[Strings]
+ProviderName       = "WinDbgLite"
+DiskName           = "WinDbgLite Memory Driver Installation Disk"
+DeviceDesc         = "WinDbgLite Memory Driver"
+ServiceDisplayName = "WinDbgLite Memory Driver"
+

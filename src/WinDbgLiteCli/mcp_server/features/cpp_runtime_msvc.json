@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "debugFeatures": [
+    {
+      "name": "msvc_rtti_dynamic_cast",
+      "category": "cpp_runtime",
+      "compiler": "msvc",
+      "arch": "any",
+      "semantic": "MSVC RTTI dynamic_cast or runtime class check",
+      "pattern": {
+        "keywords": ["__rttidynamiccast", "rtti", "type_info", "complete object locator"],
+        "mnemonics": ["call", "test", "jz"]
+      },
+      "evidence": {
+        "notes": "MSVC dynamic_cast routes through RTTI helper code and type descriptors."
+      },
+      "action": {
+        "commands": ["pc rip 160", "u rip 64", "lm"],
+        "skill": ""
+      },
+      "confidence": 0.72,
+      "notes": "seed json"
+    },
+    {
+      "name": "msvc_type_info_usage",
+      "category": "cpp_runtime",
+      "compiler": "msvc",
+      "arch": "any",
+      "semantic": "MSVC type_info or RTTI type descriptor reference",
+      "pattern": {
+        "keywords": ["type_info", ".?av", ".?au", "rtti", "type descriptor"],
+        "mnemonics": ["lea", "mov"]
+      },
+      "evidence": {
+        "notes": "RTTI records and decorated type names identify C++ class metadata."
+      },
+      "action": {
+        "commands": ["pc rip 128", "u rip 64", "da poi(rip)"],
+        "skill": ""
+      },
+      "confidence": 0.58,
+      "notes": "seed json"
+    },
+    {
+      "name": "msvc_new_array_delete_array",
+      "category": "cpp_runtime",
+      "compiler": "msvc",
+      "arch": "any",
+      "semantic": "MSVC operator new[]/delete[] allocation or release",
+      "pattern": {
+        "keywords": ["operator new[]", "operator delete[]", "??_u@", "??_v@", "eh vector destructor iterator"],
+        "mnemonics": ["call"]
+      },
+      "evidence": {
+        "notes": "Array allocation/destruction often uses decorated new[]/delete[] or vector destructor helpers."
+      },
+      "action": {
+        "commands": ["pc rip 160", "u rip 80"],
+        "skill": ""
+      },
+      "confidence": 0.7,
+      "notes": "seed json"
+    },
+    {
+      "name": "msvc_security_cookie_check",
+      "category": "cpp_runtime",
+      "compiler": "msvc",
+      "arch": "any",
+      "semantic": "MSVC /GS security cookie check or stack corruption path",
+      "pattern": {
+        "keywords": ["__security_cookie", "__security_check_cookie", "security cookie", "gs failure"],
+        "mnemonics": ["xor", "call", "cmp"]
+      },
+      "evidence": {
+        "notes": "MSVC /GS protects stack frames with cookie setup/check code."
+      },
+      "action": {
+        "commands": ["k 16", "pc rip 96", "u rip 48"],
+        "skill": "exception_triage"
+      },
+      "confidence": 0.76,
+      "notes": "seed json"
+    },
+    {
+      "name": "msvc_crt_startup",
+      "category": "cpp_runtime",
+      "compiler": "msvc",
+      "arch": "any",
+      "semantic": "MSVC CRT process startup and initializer execution",
+      "pattern": {
+        "keywords": ["__scrt_common_main", "maincrtstartup", "winmaincrtstartup", "_initterm", "_initterm_e"],
+        "mnemonics": ["call"]
+      },
+      "evidence": {
+        "notes": "CRT startup invokes initializer tables before user main/WinMain."
+      },
+      "action": {
+        "commands": ["k 16", "pc rip 160", "lm"],
+        "skill": ""
+      },
+      "confidence": 0.74,
+      "notes": "seed json"
+    },
+    {
+      "name": "windows_tls_callback",
+      "category": "cpp_runtime",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Windows TLS callback or loader initializer path",
+      "pattern": {
+        "keywords": ["tls callback", "dllmain", "ldrp", "thread_attach", "process_attach"],
+        "mnemonics": ["call"]
+      },
+      "evidence": {
+        "notes": "TLS callbacks and DllMain execute from loader paths before ordinary program code."
+      },
+      "action": {
+        "commands": ["k 24", "lm", "pc rip 128"],
+        "skill": ""
+      },
+      "confidence": 0.62,
+      "notes": "seed json"
+    }
+  ]
+}

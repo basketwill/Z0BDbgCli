@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "debugFeatures": [
+    {
+      "name": "winapi_is_debugger_present",
+      "category": "anti_debug",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "IsDebuggerPresent anti-debug check",
+      "pattern": {
+        "keywords": ["isdebuggerpresent", "beingdebugged"],
+        "mnemonics": ["call", "test", "cmp"]
+      },
+      "evidence": {
+        "notes": "Direct API or PEB BeingDebugged access is a common debugger check."
+      },
+      "action": {
+        "commands": ["pc rip 128", "u rip 64", "r"],
+        "skill": ""
+      },
+      "confidence": 0.82,
+      "notes": "seed json"
+    },
+    {
+      "name": "winapi_check_remote_debugger_present",
+      "category": "anti_debug",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "CheckRemoteDebuggerPresent anti-debug check",
+      "pattern": {
+        "keywords": ["checkremotedebuggerpresent"],
+        "mnemonics": ["call", "test", "cmp"]
+      },
+      "evidence": {
+        "notes": "The API reports whether a process has an attached debugger."
+      },
+      "action": {
+        "commands": ["pc rip 128", "u rip 64", "r"],
+        "skill": ""
+      },
+      "confidence": 0.84,
+      "notes": "seed json"
+    },
+    {
+      "name": "ntqueryinformationprocess_debug_flags",
+      "category": "anti_debug",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "NtQueryInformationProcess debug port/flags/object anti-debug query",
+      "pattern": {
+        "keywords": ["ntqueryinformationprocess", "processdebugport", "processdebugflags", "processdebugobjecthandle"],
+        "mnemonics": ["call", "cmp", "test"]
+      },
+      "evidence": {
+        "notes": "ProcessDebugPort, ProcessDebugFlags, and ProcessDebugObjectHandle are common anti-debug classes."
+      },
+      "action": {
+        "commands": ["pc rip 160", "u rip 80", "r"],
+        "skill": ""
+      },
+      "confidence": 0.82,
+      "notes": "seed json"
+    },
+    {
+      "name": "peb_nt_global_flag_check",
+      "category": "anti_debug",
+      "compiler": "any",
+      "arch": "x64",
+      "semantic": "PEB NtGlobalFlag or heap flag anti-debug check",
+      "pattern": {
+        "keywords": ["gs:[60h]", "ntglobalflag", "heap flags", "+bc", "+70h"],
+        "mnemonics": ["mov", "test", "cmp"]
+      },
+      "evidence": {
+        "notes": "Reading PEB and heap debug flags can identify debugger-created heaps."
+      },
+      "action": {
+        "commands": ["pc rip 160", "u rip 80", "r"],
+        "skill": ""
+      },
+      "confidence": 0.68,
+      "notes": "seed json"
+    },
+    {
+      "name": "timing_anti_debug_check",
+      "category": "anti_debug",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Timing based anti-debug check",
+      "pattern": {
+        "keywords": ["rdtsc", "queryperformancecounter", "gettickcount", "timegettime"],
+        "mnemonics": ["rdtsc", "call", "sub", "cmp"]
+      },
+      "evidence": {
+        "notes": "Timing checks compare elapsed cycles/time to detect breakpoints or single stepping."
+      },
+      "action": {
+        "commands": ["pc rip 160", "u rip 80", "r"],
+        "skill": ""
+      },
+      "confidence": 0.66,
+      "notes": "seed json"
+    }
+  ]
+}

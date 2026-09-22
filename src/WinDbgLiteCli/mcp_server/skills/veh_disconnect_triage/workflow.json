@@ -1,0 +1,51 @@
+{
+  "name": "veh_disconnect_triage",
+  "description": "Read-only triage when the VEH agent disconnects or the target disappears.",
+  "risk": "read-only",
+  "readOnly": true,
+  "stopOnError": false,
+  "autoTriggers": [
+    "VEH agent disconnected",
+    "debuggee exited",
+    "target disappeared"
+  ],
+  "parameterDefaults": {
+    "threadIndex": 0,
+    "maxFrames": 8
+  },
+  "steps": [
+    {
+      "tool": "wdbl_veh_status",
+      "request": {
+        "cmd": "execute",
+        "command": "veh status"
+      }
+    },
+    {
+      "tool": "wdbl_veh_modules",
+      "request": {
+        "cmd": "execute",
+        "command": "veh modules"
+      }
+    },
+    {
+      "tool": "wdbl_veh_threads",
+      "request": {
+        "cmd": "execute",
+        "command": "veh threads"
+      }
+    },
+    {
+      "tool": "wdbl_stop_info",
+      "request": {
+        "cmd": "stop_info"
+      }
+    },
+    {
+      "tool": "wdbl_breakpoints",
+      "request": {
+        "cmd": "breakpoints"
+      }
+    }
+  ]
+}

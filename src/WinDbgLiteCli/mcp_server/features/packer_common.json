@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "debugFeatures": [
+    {
+      "name": "packer_memory_protect_transition",
+      "category": "packer",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Packer/unpacker memory protection transition",
+      "pattern": {
+        "keywords": ["virtualprotect", "ntprotectvirtualmemory", "page_execute", "page_readwrite", "page_execute_readwrite"],
+        "mnemonics": ["call"]
+      },
+      "evidence": {
+        "notes": "Unpackers often switch decoded memory from writable to executable."
+      },
+      "action": {
+        "commands": ["r", "pc rip 160", "u rip 80", "lm"],
+        "skill": ""
+      },
+      "confidence": 0.78,
+      "notes": "seed json"
+    },
+    {
+      "name": "packer_dynamic_api_resolution",
+      "category": "packer",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Dynamic API resolver using module/export lookup",
+      "pattern": {
+        "keywords": ["getprocaddress", "loadlibrary", "ldrgetprocedureaddress", "ldrloaddll", "export"],
+        "mnemonics": ["call", "cmp", "loop"]
+      },
+      "evidence": {
+        "notes": "Packed or obfuscated programs often resolve APIs dynamically."
+      },
+      "action": {
+        "commands": ["pc rip 192", "u rip 96", "da rdx", "du rdx"],
+        "skill": ""
+      },
+      "confidence": 0.76,
+      "notes": "seed json"
+    },
+    {
+      "name": "packer_self_modifying_copy_loop",
+      "category": "packer",
+      "compiler": "any",
+      "arch": "any",
+      "semantic": "Self-modifying decode/copy loop candidate",
+      "pattern": {
+        "keywords": ["xor", "rol", "ror", "rep movs", "stos", "virtualprotect"],
+        "mnemonics": ["xor", "rol", "ror", "loop", "jmp"]
+      },
+      "evidence": {
+        "notes": "Decode loops transform bytes then jump into the decoded region."
+      },
+      "action": {
+        "commands": ["pc rip 224", "u rip 128", "r"],
+        "skill": ""
+      },
+      "confidence": 0.62,
+      "notes": "seed json"
+    }
+  ]
+}

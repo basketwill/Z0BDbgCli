@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "debugFeatures": [
+    {
+      "name": "msvc_std_map_tree_find",
+      "category": "cpp_std",
+      "compiler": "msvc",
+      "arch": "x64",
+      "semantic": "MSVC std::map/std::set red-black tree find/lower_bound walk",
+      "pattern": {
+        "keywords": ["std::map", "std::set", "left", "right", "parent", "cmp"],
+        "mnemonics": ["cmp", "cmov", "jz", "jnz"],
+        "required": ["cmp"]
+      },
+      "evidence": {
+        "notes": "Tree find/lower_bound walks parent/left/right links and repeatedly compares keys."
+      },
+      "action": {
+        "commands": ["pc rip 192", "u rip 96", "r"],
+        "skill": ""
+      },
+      "confidence": 0.52,
+      "notes": "seed json"
+    },
+    {
+      "name": "msvc_std_unordered_map_bucket_lookup",
+      "category": "cpp_std",
+      "compiler": "msvc",
+      "arch": "x64",
+      "semantic": "MSVC std::unordered_map/std::unordered_set hash bucket lookup",
+      "pattern": {
+        "keywords": ["unordered", "bucket", "hash", "and", "mod", "+8", "+10h"],
+        "mnemonics": ["call", "and", "cmp", "mov"]
+      },
+      "evidence": {
+        "notes": "Hash-table lookup computes a hash/index then walks a bucket chain."
+      },
+      "action": {
+        "commands": ["pc rip 192", "u rip 96"],
+        "skill": ""
+      },
+      "confidence": 0.5,
+      "notes": "seed json"
+    },
+    {
+      "name": "msvc_std_function_indirect_call",
+      "category": "cpp_std",
+      "compiler": "msvc",
+      "arch": "x64",
+      "semantic": "MSVC std::function target invocation or erased callable dispatch",
+      "pattern": {
+        "keywords": ["std::function", "call qword ptr", "invoke", "bad_function_call"],
+        "mnemonics": ["call", "test", "jz"]
+      },
+      "evidence": {
+        "notes": "std::function normally tests the erased target and calls through an invoker pointer."
+      },
+      "action": {
+        "commands": ["pc rip 160", "u rip 64", "dq rcx L8"],
+        "skill": ""
+      },
+      "confidence": 0.58,
+      "notes": "seed json"
+    },
+    {
+      "name": "msvc_vector_destructor_loop",
+      "category": "cpp_std",
+      "compiler": "msvc",
+      "arch": "x64",
+      "semantic": "MSVC std::vector element destructor loop and buffer release",
+      "pattern": {
+        "keywords": ["+8", "+10h", "operator delete", "??1"],
+        "mnemonics": ["cmp", "call", "add", "jnz"]
+      },
+      "evidence": {
+        "notes": "Non-trivial vector destruction iterates elements before freeing the allocation."
+      },
+      "action": {
+        "commands": ["pc rip 192", "u rip 96"],
+        "skill": ""
+      },
+      "confidence": 0.6,
+      "notes": "seed json"
+    },
+    {
+      "name": "msvc_string_compare",
+      "category": "cpp_std",
+      "compiler": "msvc",
+      "arch": "any",
+      "semantic": "std::basic_string compare/equality path",
+      "pattern": {
+        "keywords": ["memcmp", "+10h", "+18h", "std::basic_string"],
+        "mnemonics": ["cmp", "call", "test"]
+      },
+      "evidence": {
+        "notes": "String compare paths usually compare sizes/capacity and then call memcmp/wmemcmp."
+      },
+      "action": {
+        "commands": ["pc rip 160", "u rip 64"],
+        "skill": ""
+      },
+      "confidence": 0.62,
+      "notes": "seed json"
+    },
+    {
+      "name": "msvc_string_append_grow",
+      "category": "cpp_std",
+      "compiler": "msvc",
+      "arch": "x64",
+      "semantic": "std::basic_string append with growth/reallocation",
+      "pattern": {
+        "keywords": ["strlen", "memcpy", "operator new", "operator delete", "+10h", "+18h"],
+        "mnemonics": ["add", "cmp", "call"]
+      },
+      "evidence": {
+        "notes": "Append growth measures/copies input, allocates a larger buffer, and releases old heap storage."
+      },
+      "action": {
+        "commands": ["pc rip 224", "u rip 112"],
+        "skill": ""
+      },
+      "confidence": 0.64,
+      "notes": "seed json"
+    }
+  ]
+}

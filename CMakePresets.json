@@ -1,0 +1,55 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "vs2019-x64",
+      "displayName": "VS2019 x64",
+      "description": "Visual Studio 2019 generator, x64 architecture",
+      "generator": "Visual Studio 16 2019",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/x64"
+      }
+    },
+    {
+      "name": "vs2019-win32",
+      "displayName": "VS2019 Win32",
+      "description": "Visual Studio 2019 generator, Win32 architecture",
+      "generator": "Visual Studio 16 2019",
+      "architecture": "Win32",
+      "binaryDir": "${sourceDir}/build_win32",
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/win32"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-x64-release",
+      "displayName": "Build x64 Release",
+      "configurePreset": "vs2019-x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-win32-release",
+      "displayName": "Build Win32 Release",
+      "configurePreset": "vs2019-win32",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-win32ui-win32-release",
+      "displayName": "Build WinDbgLiteWin32UI Win32 Release",
+      "configurePreset": "vs2019-win32",
+      "configuration": "Release",
+      "targets": [
+        "WinDbgLiteWin32UI"
+      ]
+    }
+  ]
+}

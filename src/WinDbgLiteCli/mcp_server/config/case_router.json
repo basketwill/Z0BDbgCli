@@ -1,0 +1,12 @@
+{
+  "maxScanCases": 500,
+  "weights": {
+    "exceptionCode": 40,
+    "reason": 10,
+    "module": 20,
+    "symbol": 30,
+    "breakpoint": 20,
+    "stackSymbol": 8,
+    "tag": 12
+  }
+}
