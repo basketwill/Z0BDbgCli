@@ -1,6 +1,7 @@
 uicli:
-![Uploading image.png…]()
+<img width="1227" height="773" alt="image" src="https://github.com/user-attachments/assets/9beac98d-4ae3-4bb3-8001-1c0a367c9dbe" />
 
+![Uploading image.png…]()
 
 
 # WinDbgLite Functional Code Annotations
