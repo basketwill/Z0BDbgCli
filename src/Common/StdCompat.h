@@ -1,8 +1,30 @@
-﻿#pragma once
+#pragma once
 
 #include <windows.h>
 #include <process.h>
 #include <utility>
+
+//
+// Compatibility header.
+//
+// The original VS2010 (v100, C++11) toolset predates <optional>/<mutex>/
+// std::clamp, so plain shims were provided below. Modern toolsets (VS2017+)
+// ship the real standard-library implementations, and defining them again in
+// namespace std would be ill-formed (redefinition, e.g. std::clamp in
+// <algorithm>). On modern toolsets pull in the real headers instead.
+//
+#if defined(_MSC_VER) && _MSC_VER >= 1900
+#include <algorithm>
+#include <condition_variable>
+#include <mutex>
+#include <optional>
+#include <thread>
+namespace std {
+// Intentionally empty on modern toolsets: the standard library provides
+// mutex, lock_guard, unique_lock, condition_variable, nullopt/nullopt_t,
+// optional, thread and clamp.
+}
+#else  // VS2010 / pre-C++17 library shims
 
 namespace std {
 
@@ -155,3 +177,5 @@ const T& clamp(const T& value, const T& lo, const T& hi) {
 }
 
 }  // namespace std
+
+#endif  // _MSC_VER >= 1900
