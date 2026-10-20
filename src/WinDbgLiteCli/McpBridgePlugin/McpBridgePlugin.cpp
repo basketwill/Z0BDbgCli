@@ -14,6 +14,17 @@
 
 #pragma comment(lib, "bcrypt.lib")
 
+#if defined(_M_IX86)
+// MSVC decorates __stdcall exports on x86 (for example _WdblPluginGetInfo@4),
+// but the debugger host resolves the public undecorated API names. Publish an
+// undecorated alias for every entry point so the same plugin loads on x86 and x64.
+#pragma comment(linker, "/EXPORT:WdblPluginGetInfo=_WdblPluginGetInfo@4")
+#pragma comment(linker, "/EXPORT:WdblPluginInitialize=_WdblPluginInitialize@8")
+#pragma comment(linker, "/EXPORT:WdblPluginExecute=_WdblPluginExecute@8")
+#pragma comment(linker, "/EXPORT:WdblPluginShutdown=_WdblPluginShutdown@4")
+#pragma comment(linker, "/EXPORT:WdblPluginOnEvent=_WdblPluginOnEvent@8")
+#endif
+
 namespace {
 
 const wchar_t kPipeName[] = L"\\\\.\\pipe\\Z0BDbgMcpBridge";
@@ -380,8 +391,13 @@ bool ExtractString(const std::string& json, const char* key, std::string& out) {
     if (p == std::string::npos) {
         return false;
     }
-    p = json.find('"', p + 1);
-    if (p == std::string::npos) {
+    ++p;
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\r' || json[p] == '\n')) {
+        ++p;
+    }
+    // Only parse a JSON string value. Without this check a numeric value would
+    // make us scan forward to the next key and return that key name as the value.
+    if (p >= json.size() || json[p] != '"') {
         return false;
     }
     ++p;
@@ -434,7 +450,7 @@ bool ExtractUInt64(const std::string& json, const char* key, uint64_t& out) {
         return false;
     }
     ++p;
-    while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) {
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\r' || json[p] == '\n')) {
         ++p;
     }
     size_t start = p;
@@ -473,7 +489,7 @@ bool ExtractBool(const std::string& json, const char* key, bool& out) {
         return false;
     }
     ++p;
-    while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) {
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\r' || json[p] == '\n')) {
         ++p;
     }
     if (json.compare(p, 4, "true") == 0) {
@@ -750,12 +766,16 @@ std::string HandleRequest(BridgeContext* ctx, const std::string& request) {
         std::wstringstream capture;
         int32_t rc = 0;
         {
+            // Flush anything the host already buffered before we swap the stream
+            // buffer, then flush again before reading the capture buffer.
+            std::wcout.flush();
             ScopedWcoutRedirect redirect(capture.rdbuf());
             if (api->executeCommand != NULL) {
                 rc = api->executeCommand(api->context, wide.c_str());
             } else if (ctx->host.execute != NULL) {
                 rc = ctx->host.execute(ctx->host.context, wide.c_str());
             }
+            std::wcout.flush();
         }
         std::wstring output = capture.str();
         const size_t maxChars = 32768;

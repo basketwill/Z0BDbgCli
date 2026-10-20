@@ -93,6 +93,13 @@ Call `wdbl_demo_skill` with `execute=false` to preview the workflow, or `execute
 
 Generic skill tools are `wdbl_list_skills` and `wdbl_run_skill`. `wdbl_run_skill` loads `workflow.json` by skill name. Skills default to dry-run; set `execute=true` to run. Non-read-only skills must also pass `allowStateChange=true`.
 
+AI-oriented helpers:
+
+- `wdbl_ai_brief` returns a compact Markdown brief (stop, registers, stack, disassembly at IP, modules, suggested skills) in one read-only call.
+- `wdbl_disasm` returns ANSI-free text by default; pass `structured=true` for `{address, bytes, text}` rows or `raw=true` to keep colors.
+- `wdbl_disasm_range` disassembles `[start, end)` in chunks, so a whole function can be fetched without manual continuation.
+- `wdbl_model_context` now includes a short disassembly window at the current IP.
+
 Risk levels:
 
 ```text
@@ -141,6 +148,7 @@ Current tools:
 
 ```text
 wdbl_ping
+wdbl_ai_brief
 wdbl_execute
 wdbl_launch
 wdbl_attach
@@ -226,6 +234,7 @@ wdbl_current_thread_info
 wdbl_vm_info
 wdbl_memory_map
 wdbl_disasm
+wdbl_disasm_range
 wdbl_flow_graph
 wdbl_pseudo_c
 wdbl_examine_symbols

@@ -288,6 +288,7 @@ def build_model_context(
             "topStackFrames": _summarize_stack(normalized, budget_values),
             "breakpoints": _summarize_breakpoints(normalized, budget_values),
             "modules": _summarize_modules(normalized, budget_values),
+            "disasm": _text(normalized.get("disasm", ""), budget_values["maxFieldChars"] * 4),
             "event": _pick_dict(normalized.get("event", {}), ["typeName", "processId", "threadId", "address", "message", "timestamp"], budget_values["maxFieldChars"]),
         },
         "similarCases": _summarize_cases(matches, budget_values),

@@ -1,0 +1,18 @@
+# Build outputs
+/Build/
+/BuildVS2010/Build/
+/BuildVS2010/Win32/
+/BuildVS2010/x64/
+/src/VehAgent/Win32/
+/src/VehAgent/x64/
+/src/WinDbgLiteCli/McpBridgePlugin/_obj/
+
+# Python
+__pycache__/
+*.py[cod]
+/src/WinDbgLiteCli/mcp_server/data/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
