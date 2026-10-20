@@ -256,6 +256,18 @@ struct PluginModule {
           onEvent(NULL) {}
 };
 
+struct ToolRepositoryItem {
+    int id;
+    std::wstring name;
+    std::wstring kind;
+    std::wstring path;
+    std::wstring defaultArgs;
+    std::wstring description;
+
+    ToolRepositoryItem()
+        : id(0) {}
+};
+
 struct MemoryPatchRecord {
     uint64_t address;
     std::vector<uint8_t> originalBytes;
@@ -550,9 +562,24 @@ private:
     bool ExecutePluginModule(const std::wstring& token, const std::wstring& args);
     bool SetPluginModuleEnabled(const std::wstring& token, bool enabled);
     void AutoLoadPluginModules();
+    bool AddToolRepositoryItem(
+        const std::wstring& name,
+        const std::wstring& kind,
+        const std::wstring& path,
+        const std::wstring& defaultArgs,
+        const std::wstring& description);
+    bool RemoveToolRepositoryItem(const std::wstring& token);
+    void ClearToolRepository();
+    void ListToolRepository() const;
+    bool RunToolRepositoryItem(const std::wstring& token, const std::wstring& args);
+    bool SaveToolRepository(const std::wstring& filePath) const;
+    bool LoadToolRepository(const std::wstring& filePath);
+    bool ExecuteToolRepositoryCommand(const std::vector<std::wstring>& tokens);
 
     PluginModule* FindPluginModule(const std::wstring& token);
     const PluginModule* FindPluginModule(const std::wstring& token) const;
+    ToolRepositoryItem* FindToolRepositoryItem(const std::wstring& token);
+    const ToolRepositoryItem* FindToolRepositoryItem(const std::wstring& token) const;
     static void WDBL_CALL PluginHostLogThunk(void* context, const wchar_t* text);
     static int32_t WDBL_CALL PluginHostExecuteThunk(void* context, const wchar_t* command);
     static int32_t WDBL_CALL PluginHostGetStopInfoThunk(void* context, WdblStopInfo* outInfo);
@@ -783,7 +810,9 @@ private:
     ExceptionRuleSet steppingExceptionRules_;
     std::vector<std::wstring> runStopExpressions_;
     std::vector<PluginModule> pluginModules_;
+    std::vector<ToolRepositoryItem> toolRepository_;
     int nextPluginId_;
+    int nextToolRepositoryId_;
     bool pluginEventDispatchActive_;
     int activePluginDispatchIndex_;
     std::map<std::wstring, StopSnapshot> namedSnapshots_;

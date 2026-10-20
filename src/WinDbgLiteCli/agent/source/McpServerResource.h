@@ -1,0 +1,30 @@
+#pragma once
+
+#define IDD_MODEL_ADVANCED   200
+#define IDC_ADV_TOKENS       201
+#define IDC_ADV_TIMEOUT      202
+#define IDC_ADV_TEMPERATURE  203
+#define IDC_ADV_TOP_P        204
+#define IDC_ADV_TOOL_CHOICE  205
+#define IDC_ADV_TOOL_ROUNDS  206
+#define IDC_ADV_HISTORY      207
+#define IDC_ADV_STREAM       208
+#define IDC_ADV_TASK_ROUNDS  209
+#define IDC_ADV_TASK_TIMEOUT 210
+#define IDC_ADV_ROUND_WARNING 211
+#define IDC_ADV_TIME_WARNING 212
+
+#define IDD_AGENT_MODELS     300
+#define IDC_AGENT_PROFILE    301
+#define IDC_AGENT_PROVIDER   302
+#define IDC_AGENT_ENABLED    303
+#define IDC_AGENT_REVIEWER   304
+#define IDC_AGENT_URL        305
+#define IDC_AGENT_NAME       306
+#define IDC_AGENT_KEY        307
+#define IDC_AGENT_EFFORT     308
+#define IDC_AGENT_TIMEOUT    309
+#define IDC_AGENT_KEYWORDS   310
+#define IDC_AGENT_AUTO       311
+#define IDC_AGENT_FAILOVER   312
+#define IDC_AGENT_REVIEW     313

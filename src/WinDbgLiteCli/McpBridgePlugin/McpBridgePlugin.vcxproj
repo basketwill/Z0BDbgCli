@@ -69,5 +69,8 @@
   <ItemGroup>
     <ClCompile Include="McpBridgePlugin.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="..\agent\WinDbgLiteAgent.vcxproj" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

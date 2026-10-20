@@ -634,6 +634,7 @@ private:
     void RestoreStreams();
     void RunStartupPython();
     bool HandlePythonCommand(const std::wstring& command);
+    bool HandleAgentCommand(const std::wstring& command);
     std::vector<std::wstring> DrainPendingOutputs();
     void AppendStyledText(const std::wstring& text);
     void AppendStyledRun(const std::wstring& text, const TextStyle& style);
@@ -5077,6 +5078,89 @@ void GuiTerminalApp::SubmitInput() {
     ClearInputHistoryState();
 }
 
+bool GuiTerminalApp::HandleAgentCommand(const std::wstring& command) {
+    const std::wstring action = ToLower(Trim(command));
+    if (action == L"agent help") {
+        QueueOutput(L"agent: Open MCP Agent Terminal for the current debugger.\r\n"
+                    L"agent config: Open its model and permission settings.\r\n");
+        return true;
+    }
+    if (action != L"agent" && action != L"agent config") {
+        QueueOutput(L"Usage: agent [config|help]\r\n");
+        return false;
+    }
+    wchar_t executable[MAX_PATH] = {};
+    if (!GetModuleFileNameW(NULL, executable, MAX_PATH)) return false;
+    std::wstring directory(executable);
+    size_t slash = directory.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return false;
+    directory.resize(slash);
+
+    wchar_t override_path[MAX_PATH] = {};
+    DWORD length = GetEnvironmentVariableW(L"Z0BDBG_AGENT_LAUNCHER", override_path, MAX_PATH);
+    std::wstring script = length && length < MAX_PATH ? override_path : L"";
+    for (std::wstring parent = directory; script.empty() && !parent.empty();) {
+        const std::wstring candidates[] = {
+            parent + L"\\mcp_server\\agent_launcher.py",
+            parent + L"\\src\\WinDbgLiteCli\\mcp_server\\agent_launcher.py"
+        };
+        for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+            if (GetFileAttributesW(candidates[i].c_str()) != INVALID_FILE_ATTRIBUTES) {
+                script = candidates[i];
+                break;
+            }
+        }
+        slash = parent.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) break;
+        parent.resize(slash);
+    }
+    if (script.empty()) {
+        QueueOutput(L"Agent launcher not found. Set Z0BDBG_AGENT_LAUNCHER.\r\n");
+        return false;
+    }
+    if (action == L"agent") {
+        wchar_t plugin_override[MAX_PATH] = {};
+        length = GetEnvironmentVariableW(L"Z0BDBG_MCP_PLUGIN", plugin_override, MAX_PATH);
+        std::wstring plugin = length && length < MAX_PATH ? plugin_override : directory + L"\\Z0BDbgMcpBridge.dll";
+        if (GetFileAttributesW(plugin.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            QueueOutput(L"MCP bridge DLL not found. Build Z0BDbgMcpBridge or set Z0BDBG_MCP_PLUGIN.\r\n");
+            return false;
+        }
+        std::vector<std::wstring> load;
+        load.push_back(L"plugin"); load.push_back(L"load"); load.push_back(plugin);
+        std::lock_guard<std::mutex> lock(debuggerCommandMutex_);
+        if (!debugger_.ExecuteCommand(load)) return false;
+    }
+    wchar_t python_override[MAX_PATH] = {};
+    length = GetEnvironmentVariableW(L"Z0BDBG_PYTHON_EXE", python_override, MAX_PATH);
+    std::wstring python = length && length < MAX_PATH ? python_override : L"";
+    if (python.empty()) {
+        wchar_t local_app_data[MAX_PATH] = {};
+        length = GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+        if (length && length < MAX_PATH) {
+            std::wstring installed = std::wstring(local_app_data) + L"\\Python\\bin\\python.exe";
+            if (GetFileAttributesW(installed.c_str()) != INVALID_FILE_ATTRIBUTES)
+                python = installed;
+        }
+    }
+    if (python.empty()) python = L"python.exe";
+    std::wstring launch = L"\"" + python + L"\" \"" + script + L"\"";
+    if (action == L"agent config") launch += L" --configure";
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process = {};
+    if (!CreateProcessW(NULL, &launch[0], NULL, NULL, FALSE, CREATE_NEW_CONSOLE,
+                        NULL, NULL, &startup, &process)) {
+        QueueOutput(L"Could not start Python Agent launcher. Check Z0BDBG_PYTHON_EXE.\r\n");
+        return false;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    QueueOutput(action == L"agent" ? L"Opening Agent Terminal...\r\n"
+                                     : L"Opening Agent settings...\r\n");
+    return true;
+}
+
 bool GuiTerminalApp::HandlePythonCommand(const std::wstring& command) {
     const std::vector<std::wstring> tokens = Tokenize(command);
     if (tokens.empty() || ToLower(tokens[0]) != L"py") {
@@ -5265,6 +5349,10 @@ void GuiTerminalApp::WorkerLoop() {
 
             const std::wstring lower = ToLower(command);
             if (lower == L"clear" || lower == L"cls" || lower == L"history" || IsQuitCommand(lower)) {
+                continue;
+            }
+            if (ToLower(Trim(command)).rfind(L"agent", 0) == 0) {
+                HandleAgentCommand(command);
                 continue;
             }
             if (ToLower(Trim(command)).rfind(L"py", 0) == 0) {
