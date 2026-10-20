@@ -2,7 +2,7 @@
 #include "MinHook.h"
 
 
-#ifdef WIN64
+#ifdef _WIN64
 #pragma comment(lib,"minhook_2010.x64.lib")
 #else
 

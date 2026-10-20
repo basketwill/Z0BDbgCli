@@ -71,7 +71,7 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
     <TargetName>Z0BDbgVehAgent</TargetName>
-    <WdblRepoRoot>$(MSBuildThisFileDirectory)..\..\..\</WdblRepoRoot>
+    <WdblRepoRoot>$(MSBuildThisFileDirectory)..\..\</WdblRepoRoot>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Platform)'=='Win32'">
     <WdblArch>x86</WdblArch>
@@ -107,6 +107,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(ProjectDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
@@ -127,6 +128,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(ProjectDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
     </Link>
