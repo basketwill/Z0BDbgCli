@@ -1,4 +1,9 @@
 运行目录与构建产物摆放方式见 [docs/RuntimeLayout.md](docs/RuntimeLayout.md)。
+add  agent mode ， input agent command into mode
+<img width="1224" height="774" alt="image" src="https://github.com/user-attachments/assets/4cfa8eb4-a617-4872-9736-8a0c6ab36580" />
+
+
+you can use ai to debug
 
 uicli:
 <img width="1227" height="773" alt="image" src="https://github.com/user-attachments/assets/9beac98d-4ae3-4bb3-8001-1c0a367c9dbe" />
