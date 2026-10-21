@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set SOLUTION=%~dp0WinDbgLite.sln
+set SOLUTION=%~dp0..\vs2010.sln
 set CONFIG=%1
 set PLATFORM=%2
 set TOOLSET=%3
@@ -9,7 +9,6 @@ set TARGET=%4
 
 if "%CONFIG%"=="" set CONFIG=Release
 if "%PLATFORM%"=="" set PLATFORM=x64
-if "%TOOLSET%"=="" set TOOLSET=v100
 if "%TARGET%"=="" set TARGET=Build
 
 if /I "%TOOLSET%"=="v100" (
@@ -38,6 +37,11 @@ if errorlevel 1 (
 )
 
 :build
-echo Building %SOLUTION% [%CONFIG% ^| %PLATFORM% ^| %TOOLSET% ^| %TARGET%]
-"%MSBUILD_EXE%" "%SOLUTION%" /t:%TARGET% /p:Configuration=%CONFIG% /p:Platform=%PLATFORM% /p:PlatformToolset=%TOOLSET%
+if "%TOOLSET%"=="" (
+  echo Building %SOLUTION% [%CONFIG% ^| %PLATFORM% ^| project toolsets ^| %TARGET%]
+  "%MSBUILD_EXE%" "%SOLUTION%" /t:%TARGET% /p:Configuration=%CONFIG% /p:Platform=%PLATFORM%
+) else (
+  echo Building %SOLUTION% [%CONFIG% ^| %PLATFORM% ^| %TOOLSET% ^| %TARGET%]
+  "%MSBUILD_EXE%" "%SOLUTION%" /t:%TARGET% /p:Configuration=%CONFIG% /p:Platform=%PLATFORM% /p:PlatformToolset=%TOOLSET%
+)
 exit /b %errorlevel%

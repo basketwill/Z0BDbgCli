@@ -14,8 +14,6 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Z0BDbgVehAgent", "src\VehAg
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "McpBridgePlugin", "src\WinDbgLiteCli\McpBridgePlugin\McpBridgePlugin.vcxproj", "{6B1C8705-58B7-4D2F-9F2B-5C7E29A78343}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WinDbgLiteAgent", "src\WinDbgLiteCli\agent\WinDbgLiteAgent.vcxproj", "{3B1E3CF8-0D8B-46CF-8E45-099A7A109B62}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Win32 = Debug|Win32
@@ -56,14 +54,6 @@ Global
 		{6B1C8705-58B7-4D2F-9F2B-5C7E29A78343}.Release|Win32.Build.0 = Release|Win32
 		{6B1C8705-58B7-4D2F-9F2B-5C7E29A78343}.Release|x64.ActiveCfg = Release|x64
 		{6B1C8705-58B7-4D2F-9F2B-5C7E29A78343}.Release|x64.Build.0 = Release|x64
-		{3B1E3CF8-0D8B-46CF-8E45-099A7A109B62}.Debug|Win32.ActiveCfg = Debug|Win32
-		{3B1E3CF8-0D8B-46CF-8E45-099A7A109B62}.Debug|Win32.Build.0 = Debug|Win32
-		{3B1E3CF8-0D8B-46CF-8E45-099A7A109B62}.Debug|x64.ActiveCfg = Debug|x64
-		{3B1E3CF8-0D8B-46CF-8E45-099A7A109B62}.Debug|x64.Build.0 = Debug|x64
-		{3B1E3CF8-0D8B-46CF-8E45-099A7A109B62}.Release|Win32.ActiveCfg = Release|Win32
-		{3B1E3CF8-0D8B-46CF-8E45-099A7A109B62}.Release|Win32.Build.0 = Release|Win32
-		{3B1E3CF8-0D8B-46CF-8E45-099A7A109B62}.Release|x64.ActiveCfg = Release|x64
-		{3B1E3CF8-0D8B-46CF-8E45-099A7A109B62}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

@@ -1,7 +1,9 @@
 #include <windows.h>
 #include "McpServerResource.h"
 
+#ifndef WDBL_AGENT_EMBEDDED
 1 ICON "McpServer.ico"
+#endif
 
 IDD_MODEL_ADVANCED DIALOGEX 0, 0, 340, 352
 STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
@@ -70,6 +72,7 @@ BEGIN
     PUSHBUTTON "Cancel", IDCANCEL, 351, 272, 57, 18
 END
 
+#ifndef WDBL_AGENT_EMBEDDED
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION 1,0,0,0
  PRODUCTVERSION 1,0,0,0
@@ -101,3 +104,4 @@ BEGIN
         VALUE "Translation", 0x0409, 1200
     END
 END
+#endif

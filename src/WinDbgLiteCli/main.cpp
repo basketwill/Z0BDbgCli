@@ -7,8 +7,10 @@
 #include "WinDbgLiteCliResource.h"
 #include "Debugger.h"
 #include "PythonBridge.h"
+#include "agent/source/AgentEmbedded.h"
 
 #include <algorithm>
+#include <atomic>
 #include "StdCompat.h"
 #include <cstring>
 #include <deque>
@@ -36,7 +38,10 @@ const UINT WM_APP_SHOW_MEMORY_UI = WM_APP + 9;
 const UINT WM_APP_SHOW_REGISTER_UI = WM_APP + 10;
 const UINT WM_APP_SHOW_STACK_UI = WM_APP + 11;
 const UINT WM_APP_SHOW_PSEUDOC_UI = WM_APP + 12;
+const UINT WM_APP_SET_AGENT_TITLE = WM_APP + 13;
+const UINT WM_APP_AGENT_UI = WM_APP + 14;
 const UINT_PTR kOutputSelectionAutoScrollTimer = 1;
+const UINT_PTR kAgentElapsedTimer = 4;
 const UINT_PTR kTitleTabRepaintTimer = 2;
 const UINT_PTR kDisasmPageLoadTimer = 3;
 
@@ -44,6 +49,9 @@ const int kPadding = 8;
 const int kPromptWidth = 48;
 const int kPromptTextWidth = 48;
 const int kInputHeight = 24;
+const int kAgentPanelHeight = 72;
+const int kAgentStepRowHeight = 20;
+const int kAgentMaxVisibleSteps = 6;
 const int kInitialWindowWidth = 980;
 const int kInitialWindowHeight = 620;
 const int kHistoryLimit = 1000;
@@ -65,6 +73,8 @@ const int kSelectionAutoScrollIntervalMs = 45;
 const COLORREF kBackground = RGB(0, 0, 0);
 const COLORREF kForeground = RGB(255, 255, 255);
 const COLORREF kPromptColor = RGB(0, 255, 0);
+const COLORREF kCommandColor = RGB(88, 205, 218);
+const COLORREF kOptionColor = RGB(232, 198, 116);
 const COLORREF kErrorColor = RGB(255, 80, 80);
 const COLORREF kGrayColor = RGB(160, 160, 160);
 const COLORREF kTitleBarColor = RGB(46, 46, 46);
@@ -74,6 +84,7 @@ const wchar_t kTitleMenuClassName[] = L"Z0BDbgCli.TitleMenu";
 const wchar_t kGotoDialogClassName[] = L"Z0BDbgCli.GotoDialog";
 const wchar_t kSystemWindowTitle[] = L"";
 const wchar_t kWindowTitle[] = L"Z0BDBG";
+const wchar_t kAgentWindowTitle[] = L"Z0BDBG [agent]";
 const wchar_t kRichEditClassMsft[] = L"RICHEDIT50W";
 
 HCURSOR ArrowCursor() {
@@ -508,6 +519,7 @@ public:
     int Run();
 
     void QueueOutput(const std::wstring& text);
+    void QueueAgentUi(const AgentEmbeddedUiState& state);
     void HandleOutputReady();
     void SubmitInput();
     void MoveHistory(int direction);
@@ -620,7 +632,13 @@ private:
     void PaintTitleBarTab(HDC targetDc, int width);
     void PaintTitleMenu(HDC targetDc, const RECT& rc);
     void PaintCommandLinePrompt(HDC targetDc);
+    void PaintAgentPanel(HDC targetDc);
+    int AgentPanelHeight(int clientHeight) const;
+    void ApplyAgentUi();
     void SetFonts();
+    int PromptWidth() const;
+    bool HandleFontCommand(const std::wstring& command);
+    bool HandleSpacingCommand(const std::wstring& command);
     void Layout(int width, int height);
     void AppendText(const std::wstring& text);
     void AppendPlainLine(const std::wstring& text, COLORREF fg);
@@ -635,6 +653,8 @@ private:
     void RunStartupPython();
     bool HandlePythonCommand(const std::wstring& command);
     bool HandleAgentCommand(const std::wstring& command);
+    bool StartEmbeddedAgent();
+    bool HandleEmbeddedAgentInput(const std::wstring& command);
     std::vector<std::wstring> DrainPendingOutputs();
     void AppendStyledText(const std::wstring& text);
     void AppendStyledRun(const std::wstring& text, const TextStyle& style);
@@ -646,6 +666,7 @@ private:
     void ResetOutputTextIndex();
     void AppendOutputTextIndex(const std::wstring& text);
     POINT GetOutputTextOrigin() const;
+    LONG MeasureOutputTextWidth(LONG start, LONG end) const;
     LONG OutputCharFromPoint(const POINTL& pt) const;
     size_t OutputLineFromChar(LONG charIndex) const;
     bool GetOutputLineTextSpan(size_t line, LONG* start, LONG* end) const;
@@ -666,6 +687,7 @@ private:
     void QueueOutputSelectionPaint();
     void RedrawCommandLineArea();
     void UpdateInputText(const std::wstring& text);
+    void RefreshInputHighlight();
     std::wstring ReadInputText() const;
     bool CopyOutputSelectionToClipboard();
     bool PasteClipboardToInput();
@@ -689,6 +711,7 @@ private:
     HWND hwnd_;
     HWND outputWnd_;
     HWND inputWnd_;
+    bool updatingInputHighlight_ = false;
     HWND disasmToolWnd_;
     HWND disasmViewWnd_;
     HWND memoryToolWnd_;
@@ -707,6 +730,8 @@ private:
     COLORREF gotoStatusColor_;
     std::vector<std::wstring> gotoHistory_;
     HFONT font_;
+    int fontHeight_;
+    int lineSpacing_;
     HFONT disasmFont_;
     bool ownsFont_;
     int titleButtonHover_;
@@ -721,6 +746,14 @@ private:
 
     Debugger debugger_;
     PythonBridge pythonBridge_;
+    std::atomic<bool> embeddedAgentMode_{false};
+    std::mutex agentUiMutex_;
+    AgentEmbeddedUiState pendingAgentUi_, agentUi_;
+    ULONGLONG agentWorkingStarted_ = 0;
+    ULONGLONG agentElapsedMs_ = 0;
+    int agentObservedHits_ = 0;
+    bool agentAwaitingBreakpoint_ = false;
+    unsigned agentBreakpointRunSequence_ = 0;
     class OutputStreamBuf* sink_;
     std::wstreambuf* oldCoutBuf_;
     std::wstreambuf* oldCerrBuf_;
@@ -948,6 +981,8 @@ GuiTerminalApp::GuiTerminalApp()
       gotoBusy_(false),
       gotoStatusColor_(kErrorColor),
       font_(nullptr),
+      fontHeight_(14),
+      lineSpacing_(0),
       disasmFont_(nullptr),
       ownsFont_(false),
       titleButtonHover_(-1),
@@ -1313,6 +1348,10 @@ bool GuiTerminalApp::CreateMainWindow() {
 }
 
 bool GuiTerminalApp::CreateChildControls() {
+    richEditModule_ = LoadLibraryW(L"Msftedit.dll");
+    if (richEditModule_ == nullptr) {
+        return false;
+    }
     outputWnd_ = CreateWindowExW(
         0,
         kOutputClassName,
@@ -1326,7 +1365,7 @@ bool GuiTerminalApp::CreateChildControls() {
 
     inputWnd_ = CreateWindowExW(
         0,
-        L"EDIT",
+        kRichEditClassMsft,
         L"",
         WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | ES_AUTOHSCROLL | ES_NOHIDESEL,
         0, 0, 0, 0,
@@ -1343,6 +1382,8 @@ bool GuiTerminalApp::CreateChildControls() {
     SetWindowLongPtrW(outputWnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
     inputOrigProc_ = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(inputWnd_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&GuiTerminalApp::InputWndProc)));
+    SendMessageW(inputWnd_, EM_SETBKGNDCOLOR, 0, static_cast<LPARAM>(kBackground));
+    SendMessageW(inputWnd_, EM_SETEVENTMASK, 0, ENM_CHANGE);
 
     SetFonts();
     UpdateOutputMetrics();
@@ -2374,7 +2415,10 @@ void GuiTerminalApp::PaintTitleBarTab(HDC targetDc, int width) {
     }
 
     RECT textRect = {tabLeft + textX, tabTop + textTop, tabLeft + tabWidth - 8, tabTop + textTop + textHeight};
-    DrawTextW(targetDc, kWindowTitle, -1, &textRect, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+    wchar_t caption[128] = {};
+    GetWindowTextW(hwnd_, caption, _countof(caption));
+    DrawTextW(targetDc, caption[0] ? caption : kWindowTitle, -1, &textRect,
+              DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
     const int actionX = tabLeft + tabWidth + 3;
     if (actionX + kTitleActionWidth < buttonLeft) {
@@ -2461,6 +2505,123 @@ void GuiTerminalApp::PaintTitleBarTab(HDC targetDc, int width) {
     }
 }
 
+int GuiTerminalApp::AgentPanelHeight(int clientHeight) const {
+    const int count = static_cast<int>(agentUi_.task_steps.size());
+    const int rows = std::min(count, kAgentMaxVisibleSteps) +
+        (count > kAgentMaxVisibleSteps ? 1 : 0);
+    const int textRow = std::max(kAgentStepRowHeight, lineHeight_ - lineSpacing_ + 4);
+    const int desired = std::max(kAgentPanelHeight, textRow * 4 + 6) + rows * textRow;
+    const int available = clientHeight - kCustomTitleHeight - 2 * kPadding -
+        std::max(kInputHeight, lineHeight_ - lineSpacing_ + 8) - 24;
+    return std::min(desired, std::max(40, available));
+}
+
+void GuiTerminalApp::PaintAgentPanel(HDC targetDc) {
+    if (!embeddedAgentMode_ || !inputWnd_ || !targetDc) return;
+    RECT input = {};
+    GetWindowRect(inputWnd_, &input);
+    MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&input), 2);
+    RECT client = {};
+    GetClientRect(hwnd_, &client);
+    RECT panel = {kPadding, input.top - AgentPanelHeight(client.bottom) - 4, input.right,
+        input.top - 4};
+    const int savedDc = SaveDC(targetDc);
+    IntersectClipRect(targetDc, panel.left, panel.top, panel.right, panel.bottom);
+    HBRUSH background = CreateSolidBrush(RGB(24, 28, 30));
+    FillRect(targetDc, &panel, background);
+    DeleteObject(background);
+    HPEN border = CreatePen(PS_SOLID, 1, RGB(70, 83, 88));
+    HGDIOBJ previousPen = SelectObject(targetDc, border);
+    MoveToEx(targetDc, panel.left, panel.top, nullptr);
+    LineTo(targetDc, panel.right, panel.top);
+    SelectObject(targetDc, previousPen);
+    DeleteObject(border);
+    HGDIOBJ previousFont = font_ ? SelectObject(targetDc, font_) : nullptr;
+    const int textRow = std::max(kAgentStepRowHeight, lineHeight_ - lineSpacing_ + 4);
+    const int headerHeight = std::max(kAgentPanelHeight, textRow * 4 + 6);
+    const int previousMode = SetBkMode(targetDc, TRANSPARENT);
+    const COLORREF previousColor = SetTextColor(targetDc, RGB(135, 211, 219));
+    const ULONGLONG elapsed = agentUi_.working ? GetTickCount64() - agentWorkingStarted_ : agentElapsedMs_;
+    const ULONGLONG seconds = elapsed / 1000;
+    std::wstring timer = std::to_wstring(seconds / 60) + L":" +
+        (seconds % 60 < 10 ? L"0" : L"") + std::to_wstring(seconds % 60);
+    std::wstring status = L"AGENT  " +
+        (agentUi_.approval ? std::wstring(L"Approval required") :
+            agentUi_.phase.empty() ? std::wstring(L"Ready") : agentUi_.phase) +
+        L"  |  " + timer;
+    if (agentUi_.hit_target > 0)
+        status += L"  |  Hits " + std::to_wstring(agentUi_.hits) +
+            L"/" + std::to_wstring(agentUi_.hit_target);
+    else if (agentObservedHits_ > 0 || agentAwaitingBreakpoint_)
+        status += L"  |  Breakpoints " + std::to_wstring(agentObservedHits_) +
+            (agentAwaitingBreakpoint_ ? L" (waiting)" : L"");
+    RECT first = {panel.left + 10, panel.top + 5, panel.right - 10, panel.top + 5 + textRow};
+    DrawTextW(targetDc, status.c_str(), -1, &first,
+        DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetTextColor(targetDc, RGB(135, 211, 219));
+    const std::wstring model = L"Model  " + (agentUi_.model.empty() ? L"(unavailable)" : agentUi_.model);
+    RECT modelRow = {panel.left + 10, panel.top + 5 + textRow,
+        panel.right - 10, panel.top + 5 + textRow * 2};
+    DrawTextW(targetDc, model.c_str(), -1, &modelRow,
+        DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetTextColor(targetDc, RGB(204, 211, 214));
+    std::wstring task = agentUi_.task;
+    if (task.empty()) task = L"No active task";
+    if (!agentUi_.task_state.empty()) task += L"  |  " + agentUi_.task_state;
+    RECT second = {panel.left + 10, panel.top + 5 + textRow * 2,
+        panel.right - 10, panel.top + 5 + textRow * 3};
+    DrawTextW(targetDc, task.c_str(), -1, &second,
+        DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetTextColor(targetDc, RGB(163, 184, 178));
+    std::wstring step = agentUi_.steps > 0 ?
+        L"Step " + std::to_wstring(agentUi_.step) + L"/" +
+            std::to_wstring(agentUi_.steps) + L"  " : L"";
+    step += agentUi_.approval ? L"Waiting for confirmation: " + agentUi_.detail :
+        !agentUi_.current_step.empty() ? agentUi_.current_step : agentUi_.detail;
+    RECT third = {panel.left + 10, panel.top + 5 + textRow * 3,
+        panel.right - 10, panel.top + headerHeight};
+    DrawTextW(targetDc, step.c_str(), -1, &third,
+        DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    const int total = static_cast<int>(agentUi_.task_steps.size());
+    const int shown = std::min(total, kAgentMaxVisibleSteps);
+    const int start = total > shown && agentUi_.current_step_index >= shown ?
+        std::min(total - shown, agentUi_.current_step_index - shown / 2) : 0;
+    for (int i = 0; i < shown; ++i) {
+        const int index = start + i;
+        const AgentEmbeddedStep& item = agentUi_.task_steps[index];
+        const std::wstring state = ToLower(item.status);
+        const bool active = index == agentUi_.current_step_index;
+        const COLORREF color = state == L"completed" || state == L"verified" ?
+            RGB(126, 206, 149) : state == L"failed" || state == L"blocked" ?
+            RGB(224, 120, 112) : active || state == L"running" || state == L"verifying" ?
+            RGB(88, 205, 218) : state == L"paused" ?
+            RGB(232, 198, 116) : RGB(146, 154, 163);
+        SetTextColor(targetDc, color);
+        std::wstring label = (active ? L"> " : L"  ") + std::to_wstring(index + 1) +
+            L"  [" + item.status + L"]";
+        if (item.model_slot >= 0) label += L"  M" + std::to_wstring(item.model_slot);
+        label += L"  " + item.title;
+        RECT row = {panel.left + 10, panel.top + headerHeight +
+            i * textRow - 1, panel.right - 10,
+            panel.top + headerHeight + (i + 1) * textRow};
+        DrawTextW(targetDc, label.c_str(), -1, &row,
+            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+    if (total > shown) {
+        SetTextColor(targetDc, RGB(146, 154, 163));
+        const std::wstring overflow = L"  Showing " + std::to_wstring(start + 1) +
+            L"-" + std::to_wstring(start + shown) + L" of " + std::to_wstring(total);
+        RECT row = {panel.left + 10, panel.top + headerHeight +
+            shown * textRow - 1, panel.right - 10, panel.bottom};
+        DrawTextW(targetDc, overflow.c_str(), -1, &row,
+            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+    SetTextColor(targetDc, previousColor);
+    SetBkMode(targetDc, previousMode);
+    if (previousFont) SelectObject(targetDc, previousFont);
+    RestoreDC(targetDc, savedDc);
+}
+
 void GuiTerminalApp::PaintCommandLinePrompt(HDC targetDc) {
     if (targetDc == nullptr || hwnd_ == nullptr || inputWnd_ == nullptr || !IsWindow(hwnd_) || !IsWindow(inputWnd_)) {
         return;
@@ -2470,7 +2631,7 @@ void GuiTerminalApp::PaintCommandLinePrompt(HDC targetDc) {
     GetWindowRect(inputWnd_, &input);
     MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&input), 2);
 
-    const int promptWidth = std::max<int>(kPromptWidth, kPromptTextWidth);
+    const int promptWidth = PromptWidth();
     RECT prompt = {
         kPadding,
         input.top,
@@ -2501,7 +2662,8 @@ void GuiTerminalApp::PaintCommandLinePrompt(HDC targetDc) {
     textRect.left += 2;
     textRect.top = textTop;
     textRect.bottom = textTop + textHeight;
-    DrawTextW(targetDc, L"z0dbg> ", -1, &textRect, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(targetDc, embeddedAgentMode_ ? L"agent> " : L"z0dbg> ",
+        -1, &textRect, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
 
     SetTextColor(targetDc, oldTextColor);
     SetBkColor(targetDc, oldBkColor);
@@ -2553,13 +2715,8 @@ void GuiTerminalApp::DestroyChildControls() {
 }
 
 void GuiTerminalApp::SetFonts() {
-    if (font_ != nullptr) {
-        if (ownsFont_) {
-            DeleteObject(font_);
-        }
-        font_ = nullptr;
-        ownsFont_ = false;
-    }
+    HFONT previous = font_;
+    const bool ownedPrevious = ownsFont_;
     const wchar_t chineseFace[] = {
         static_cast<wchar_t>(0x65B0),
         static_cast<wchar_t>(0x5B8B),
@@ -2568,7 +2725,7 @@ void GuiTerminalApp::SetFonts() {
     };
     const wchar_t* face = IsChineseUserInterface() ? chineseFace : L"Consolas";
     font_ = CreateFontW(
-        -12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        -fontHeight_, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         FIXED_PITCH | FF_MODERN, face);
     if (font_ == nullptr) {
@@ -2584,6 +2741,68 @@ void GuiTerminalApp::SetFonts() {
     if (inputWnd_ != nullptr) {
         SendMessageW(inputWnd_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     }
+    if (ownedPrevious && previous != nullptr) DeleteObject(previous);
+}
+
+int GuiTerminalApp::PromptWidth() const {
+    return std::max(kPromptWidth, 8 * charWidth_ + 4);
+}
+
+bool GuiTerminalApp::HandleFontCommand(const std::wstring& command) {
+    const std::wstring value = Trim(command.substr(command[0] == L'/' ? 5 : 4));
+    if (value.empty()) {
+        AppendPlainLine(L"Font height: " + std::to_wstring(fontHeight_) + L" px\r\n", kForeground);
+        return true;
+    }
+    int height = 0;
+    for (wchar_t digit : value) {
+        if (digit < L'0' || digit > L'9') {
+            AppendPlainLine(L"Usage: /font <8-24> (pixels)\r\n", kErrorColor);
+            return true;
+        }
+        height = height * 10 + (digit - L'0');
+        if (height > 24) break;
+    }
+    if (height < 8 || height > 24) {
+        AppendPlainLine(L"Usage: /font <8-24> (pixels)\r\n", kErrorColor);
+        return true;
+    }
+    fontHeight_ = height;
+    SetFonts();
+    UpdateOutputMetrics();
+    RECT client = {};
+    GetClientRect(hwnd_, &client);
+    Layout(client.right - client.left, client.bottom - client.top);
+    RedrawCommandLineArea();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    AppendPlainLine(L"Font height: " + std::to_wstring(fontHeight_) + L" px\r\n", kForeground);
+    return true;
+}
+
+bool GuiTerminalApp::HandleSpacingCommand(const std::wstring& command) {
+    const std::wstring value = Trim(command.substr(command[0] == L'/' ? 8 : 7));
+    if (value.empty()) {
+        AppendPlainLine(L"Line spacing: " + std::to_wstring(lineSpacing_) + L" px\r\n", kForeground);
+        return true;
+    }
+    int spacing = 0;
+    for (wchar_t digit : value) {
+        if (digit < L'0' || digit > L'9') {
+            AppendPlainLine(L"Usage: /spacing <0-16> (pixels)\r\n", kErrorColor);
+            return true;
+        }
+        spacing = spacing * 10 + (digit - L'0');
+        if (spacing > 16) break;
+    }
+    if (spacing > 16) {
+        AppendPlainLine(L"Usage: /spacing <0-16> (pixels)\r\n", kErrorColor);
+        return true;
+    }
+    lineSpacing_ = spacing;
+    UpdateOutputMetrics();
+    ScrollOutputToEnd();
+    AppendPlainLine(L"Line spacing: " + std::to_wstring(lineSpacing_) + L" px\r\n", kForeground);
+    return true;
 }
 
 void GuiTerminalApp::Layout(int width, int height) {
@@ -2593,11 +2812,14 @@ void GuiTerminalApp::Layout(int width, int height) {
     const int clientWidth = std::max<int>(1, width - (2 * kPadding));
     const int contentTop = kCustomTitleHeight + kPadding;
     const int clientHeight = std::max<int>(1, height - contentTop - kPadding);
-    const int inputY = contentTop + clientHeight - kInputHeight;
-    const int outputHeight = std::max<int>(1, inputY - contentTop - 6);
+    const int inputHeight = std::max(kInputHeight, lineHeight_ - lineSpacing_ + 8);
+    const int inputY = contentTop + clientHeight - inputHeight;
+    const int outputHeight = std::max<int>(1, inputY - contentTop - 6 -
+        (embeddedAgentMode_ ? AgentPanelHeight(height) + 4 : 0));
 
     MoveWindow(outputWnd_, kPadding, contentTop, clientWidth, outputHeight, TRUE);
-    MoveWindow(inputWnd_, kPadding + kPromptWidth, inputY, std::max(20, clientWidth - kPromptWidth), kInputHeight, TRUE);
+    const int promptWidth = PromptWidth();
+    MoveWindow(inputWnd_, kPadding + promptWidth, inputY, std::max(20, clientWidth - promptWidth), inputHeight, TRUE);
 }
 
 void GuiTerminalApp::UpdateOutputMetrics() {
@@ -2612,7 +2834,7 @@ void GuiTerminalApp::UpdateOutputMetrics() {
     TEXTMETRICW tm = {};
     if (GetTextMetricsW(dc, &tm)) {
         charWidth_ = std::max<int>(6, static_cast<int>(tm.tmAveCharWidth));
-        lineHeight_ = std::max<int>(1, static_cast<int>(tm.tmHeight));
+        lineHeight_ = std::max<int>(1, static_cast<int>(tm.tmHeight) + lineSpacing_);
     }
     SelectObject(dc, old);
     ReleaseDC(outputWnd_, dc);
@@ -2713,6 +2935,20 @@ POINT GuiTerminalApp::GetOutputTextOrigin() const {
     POINT pt; pt.x = 0; pt.y = 0; return pt;
 }
 
+LONG GuiTerminalApp::MeasureOutputTextWidth(LONG start, LONG end) const {
+    if (outputWnd_ == nullptr || start < 0 || end <= start ||
+        static_cast<size_t>(end) > outputText_.size()) return 0;
+    HDC dc = GetDC(outputWnd_);
+    if (dc == nullptr) return (end - start) * std::max(1, charWidth_);
+    HGDIOBJ previous = font_ ? SelectObject(dc, font_) : nullptr;
+    SIZE extent = {};
+    const bool measured = GetTextExtentPoint32W(dc, outputText_.data() + start,
+        end - start, &extent) != 0;
+    if (previous) SelectObject(dc, previous);
+    ReleaseDC(outputWnd_, dc);
+    return measured ? extent.cx : (end - start) * std::max(1, charWidth_);
+}
+
 LONG GuiTerminalApp::OutputCharFromPoint(const POINTL& pt) const {
     if (outputText_.empty() || outputLineStarts_.empty()) {
         return 0;
@@ -2732,7 +2968,19 @@ LONG GuiTerminalApp::OutputCharFromPoint(const POINTL& pt) const {
         return static_cast<LONG>(outputText_.size());
     }
 
-    const LONG column = std::max<LONG>(0, (pt.x - origin.x) / safeCharWidth);
+    const int x = std::max(0, static_cast<int>(pt.x - origin.x));
+    HDC dc = GetDC(outputWnd_);
+    if (dc != nullptr) {
+        HGDIOBJ previous = font_ ? SelectObject(dc, font_) : nullptr;
+        int fit = 0;
+        SIZE extent = {};
+        const bool measured = GetTextExtentExPointW(dc, outputText_.data() + lineStart,
+            lineEnd - lineStart, x, &fit, nullptr, &extent) != 0;
+        if (previous) SelectObject(dc, previous);
+        ReleaseDC(outputWnd_, dc);
+        if (measured) return lineStart + fit;
+    }
+    const LONG column = x / safeCharWidth;
     return std::max<LONG>(0, std::min<LONG>(lineStart + column, lineEnd));
 }
 
@@ -2779,14 +3027,17 @@ void GuiTerminalApp::StartWorker() {
 }
 
 void GuiTerminalApp::StopWorker() {
+    AgentEmbeddedCancel();
     {
         std::lock_guard<std::mutex> lock(commandMutex_);
         stopWorker_ = true;
+        commandQueue_.clear();
     }
     commandCv_.notify_all();
     if (worker_.joinable()) {
         worker_.join();
     }
+    AgentEmbeddedStop();
 }
 
 void GuiTerminalApp::QueueOutput(const std::wstring& text) {
@@ -2797,6 +3048,47 @@ void GuiTerminalApp::QueueOutput(const std::wstring& text) {
     if (hwnd_ != nullptr && IsWindow(hwnd_)) {
         PostMessageW(hwnd_, WM_APP_OUTPUT_READY, 0, 0);
     }
+}
+
+void GuiTerminalApp::QueueAgentUi(const AgentEmbeddedUiState& state) {
+    {
+        std::lock_guard<std::mutex> lock(agentUiMutex_);
+        pendingAgentUi_ = state;
+    }
+    if (hwnd_ != nullptr && IsWindow(hwnd_)) PostMessageW(hwnd_, WM_APP_AGENT_UI, 0, 0);
+}
+
+void GuiTerminalApp::ApplyAgentUi() {
+    AgentEmbeddedUiState next;
+    {
+        std::lock_guard<std::mutex> lock(agentUiMutex_);
+        next = pendingAgentUi_;
+    }
+    RECT bounds = {};
+    GetClientRect(hwnd_, &bounds);
+    const int previousPanelHeight = AgentPanelHeight(bounds.bottom);
+    if (next.working && !agentUi_.working) {
+        agentWorkingStarted_ = GetTickCount64();
+        agentElapsedMs_ = 0;
+        agentObservedHits_ = 0;
+        agentAwaitingBreakpoint_ = false;
+        agentBreakpointRunSequence_ = 0;
+        SetTimer(hwnd_, kAgentElapsedTimer, 1000, nullptr);
+    } else if (!next.working && agentUi_.working) {
+        agentElapsedMs_ = next.elapsed_ms;
+        KillTimer(hwnd_, kAgentElapsedTimer);
+    } else if (!next.working) {
+        agentElapsedMs_ = next.elapsed_ms;
+    }
+    if (next.breakpoint_run_sequence != agentBreakpointRunSequence_) {
+        agentBreakpointRunSequence_ = next.breakpoint_run_sequence;
+        agentAwaitingBreakpoint_ = true;
+        SetTimer(hwnd_, kAgentElapsedTimer, 1000, nullptr);
+    }
+    agentUi_ = next;
+    if (AgentPanelHeight(bounds.bottom) != previousPanelHeight)
+        Layout(bounds.right, bounds.bottom);
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 std::vector<std::wstring> GuiTerminalApp::DrainPendingOutputs() {
@@ -2872,8 +3164,8 @@ bool GuiTerminalApp::GetOutputRangeBounds(LONG rangeStart, LONG rangeEnd, RECT* 
 
         const LONG visualLine = static_cast<LONG>(line) - static_cast<LONG>(topLine_);
         const LONG row = visualLine;
-        const LONG startX = static_cast<LONG>(origin.x + (start - lineStart) * colWidth);
-        const LONG endX = static_cast<LONG>(origin.x + (end - lineStart) * colWidth);
+        const LONG startX = origin.x + MeasureOutputTextWidth(lineStart, start);
+        const LONG endX = origin.x + MeasureOutputTextWidth(lineStart, end);
         const LONG y = origin.y + row * rowHeight;
         if (y >= client.bottom || y + rowHeight <= client.top) {
             continue;
@@ -2955,7 +3247,11 @@ void GuiTerminalApp::PaintOutputContentToDc(HDC targetDc, const RECT& clip) {
                     continue;
                 }
 
-                const LONG width = static_cast<LONG>(run.text.size()) * colWidth;
+                SIZE extent = {};
+                const LONG width = GetTextExtentPoint32W(targetDc, run.text.c_str(),
+                    static_cast<int>(run.text.size()), &extent) ?
+                    std::max<LONG>(1, extent.cx) :
+                    static_cast<LONG>(run.text.size()) * colWidth;
                 if (run.style.hasBg) {
                     RECT fill = {x, y, x + width, y + rowHeight};
                     HBRUSH brush = CreateSolidBrush(run.style.bg);
@@ -3017,8 +3313,8 @@ void GuiTerminalApp::PaintOutputSelectionRangeToDc(HDC targetDc, const RECT& cli
 
         const LONG visualLine = static_cast<LONG>(line) - static_cast<LONG>(topLine_);
         const LONG row = visualLine;
-        const LONG startX = static_cast<LONG>(origin.x + (start - lineStart) * colWidth);
-        const LONG endX = static_cast<LONG>(origin.x + (end - lineStart) * colWidth);
+        const LONG startX = origin.x + MeasureOutputTextWidth(lineStart, start);
+        const LONG endX = origin.x + MeasureOutputTextWidth(lineStart, end);
         const LONG y = origin.y + row * rowHeight;
 
         RECT selectionRect = {
@@ -3421,7 +3717,7 @@ void GuiTerminalApp::AppendText(const std::wstring& text) {
 void GuiTerminalApp::AppendPromptedCommand(const std::wstring& command) {
     TextStyle prompt;
     prompt.fg = kPromptColor;
-    AppendStyledRun(L"z0dbg> ", prompt);
+    AppendStyledRun(embeddedAgentMode_ ? L"agent> " : L"z0dbg> ", prompt);
     TextStyle body;
     body.fg = kForeground;
     AppendStyledRun(command + L"\r\n", body);
@@ -3497,6 +3793,46 @@ void GuiTerminalApp::UpdateInputText(const std::wstring& text) {
     }
     SetWindowTextW(inputWnd_, text.c_str());
     SendMessageW(inputWnd_, EM_SETSEL, static_cast<WPARAM>(text.size()), static_cast<LPARAM>(text.size()));
+}
+
+void GuiTerminalApp::RefreshInputHighlight() {
+    if (inputWnd_ == nullptr || updatingInputHighlight_) {
+        return;
+    }
+    updatingInputHighlight_ = true;
+    const std::wstring text = ReadInputText();
+    CHARRANGE saved = {};
+    SendMessageW(inputWnd_, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&saved));
+
+    CHARFORMAT2W format = {};
+    format.cbSize = sizeof(format);
+    format.dwMask = CFM_COLOR;
+    format.crTextColor = kForeground;
+    SendMessageW(inputWnd_, EM_SETSEL, 0, -1);
+    SendMessageW(inputWnd_, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+
+    size_t first = text.find_first_not_of(L" \t");
+    if (first != std::wstring::npos) {
+        const size_t end = text.find_first_of(L" \t", first);
+        const size_t commandEnd = end == std::wstring::npos ? text.size() : end;
+        if (!embeddedAgentMode_ || text[first] == L'/') {
+            format.crTextColor = kCommandColor;
+            SendMessageW(inputWnd_, EM_SETSEL, first, commandEnd);
+            SendMessageW(inputWnd_, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+        }
+        if (!embeddedAgentMode_ && ToLower(text.substr(first, commandEnd - first)) == L"agent") {
+            size_t option = text.find_first_not_of(L" \t", commandEnd);
+            if (option != std::wstring::npos && text[option] == L'-') {
+                const size_t optionEnd = text.find_first_of(L" \t", option);
+                format.crTextColor = kOptionColor;
+                SendMessageW(inputWnd_, EM_SETSEL, option,
+                    optionEnd == std::wstring::npos ? text.size() : optionEnd);
+                SendMessageW(inputWnd_, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+            }
+        }
+    }
+    SendMessageW(inputWnd_, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&saved));
+    updatingInputHighlight_ = false;
 }
 
 void GuiTerminalApp::RedrawCommandLineArea() {
@@ -5027,6 +5363,10 @@ void GuiTerminalApp::PaintMemoryView(HDC targetDc, const RECT& clip) {
 
 void GuiTerminalApp::SubmitInput() {
     const std::wstring text = Trim(ReadInputText());
+    if (embeddedAgentMode_ && (ToLower(text) == L"exit" || ToLower(text) == L"/exit" ||
+        ToLower(text) == L"/detach")) {
+        AgentEmbeddedCancel();
+    }
     if (text.empty()) {
         UpdateInputText(L"");
         ClearInputHistoryState();
@@ -5039,6 +5379,23 @@ void GuiTerminalApp::SubmitInput() {
     }
     AddHistory(text);
     AppendPromptedCommand(text);
+    const std::wstring lower = ToLower(text);
+    if (lower == L"font" || lower == L"/font" || lower.rfind(L"font ", 0) == 0 ||
+        lower.rfind(L"/font ", 0) == 0) {
+        HandleFontCommand(text);
+        EndOutputBatch(true);
+        UpdateInputText(L"");
+        ClearInputHistoryState();
+        return;
+    }
+    if (lower == L"spacing" || lower == L"/spacing" || lower.rfind(L"spacing ", 0) == 0 ||
+        lower.rfind(L"/spacing ", 0) == 0) {
+        HandleSpacingCommand(text);
+        EndOutputBatch(true);
+        UpdateInputText(L"");
+        ClearInputHistoryState();
+        return;
+    }
     if (IsClearCommand(text)) {
         if (outputWnd_ != nullptr) {
             SetWindowTextW(outputWnd_, L"");
@@ -5057,7 +5414,7 @@ void GuiTerminalApp::SubmitInput() {
         ClearInputHistoryState();
         return;
     }
-    if (IsQuitCommand(text)) {
+    if (!embeddedAgentMode_ && IsQuitCommand(text)) {
         if (batchOutput) {
             EndOutputBatch(true);
         }
@@ -5078,15 +5435,60 @@ void GuiTerminalApp::SubmitInput() {
     ClearInputHistoryState();
 }
 
-bool GuiTerminalApp::HandleAgentCommand(const std::wstring& command) {
+static void EmbeddedAgentOutput(void* context, const std::wstring& text) {
+    static_cast<GuiTerminalApp*>(context)->QueueOutput(text);
+}
+
+static void EmbeddedAgentUiOutput(void* context, const AgentEmbeddedUiState& state) {
+    static_cast<GuiTerminalApp*>(context)->QueueAgentUi(state);
+}
+
+bool GuiTerminalApp::StartEmbeddedAgent() {
+    if (!AgentEmbeddedStart(debugger_.GetDebuggerApi(), hwnd_, EmbeddedAgentOutput,
+        EmbeddedAgentUiOutput, this)) {
+        QueueOutput(L"Could not start the embedded Agent. Check agent/McpServer.ini.\r\n");
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(commandMutex_);
+        if (stopWorker_) {
+            AgentEmbeddedStop();
+            return false;
+        }
+    }
+    embeddedAgentMode_ = true;
+    PostMessageW(hwnd_, WM_APP_SET_AGENT_TITLE, TRUE, 0);
+    return true;
+}
+
+bool GuiTerminalApp::HandleEmbeddedAgentInput(const std::wstring& command) {
     const std::wstring action = ToLower(Trim(command));
-    if (action == L"agent help") {
-        QueueOutput(L"agent: Open MCP Agent Terminal for the current debugger.\r\n"
-                    L"agent config: Open its model and permission settings.\r\n");
+    if (action == L"/config") return HandleAgentCommand(L"agent --config");
+    if (action == L"exit" || action == L"/exit" || action == L"/detach") {
+        AgentEmbeddedStop();
+        embeddedAgentMode_ = false;
+        PostMessageW(hwnd_, WM_APP_SET_AGENT_TITLE, FALSE, 0);
+        if (action == L"/detach") return HandleAgentCommand(L"agent --detach");
+        QueueOutput(L"Agent mode closed.\r\n");
         return true;
     }
-    if (action != L"agent" && action != L"agent config") {
-        QueueOutput(L"Usage: agent [config|help]\r\n");
+    return AgentEmbeddedInput(command);
+}
+
+bool GuiTerminalApp::HandleAgentCommand(const std::wstring& command) {
+    const std::wstring action = ToLower(Trim(command));
+    if (action == L"agent help" || action == L"agent --help") {
+        QueueOutput(L"agent: Enter the in-process Agent mode.\r\n"
+                    L"agent --detach: Open a separate Agent terminal via the bridge.\r\n"
+                    L"agent --config: Open Agent settings.\r\n"
+                    L"mcp server: Start a standalone MCP endpoint for external clients.\r\n"
+                    L"Agent mode: /exit returns to CLI; /detach opens a separate terminal.\r\n");
+        return true;
+    }
+    if (action == L"agent") return StartEmbeddedAgent();
+    if (action != L"agent --detach" && action != L"agent --config" &&
+        action != L"agent config" && action != L"mcp server") {
+        QueueOutput(L"Usage: agent [--detach|--config|--help]\r\n");
         return false;
     }
     wchar_t executable[MAX_PATH] = {};
@@ -5095,6 +5497,22 @@ bool GuiTerminalApp::HandleAgentCommand(const std::wstring& command) {
     size_t slash = directory.find_last_of(L"\\/");
     if (slash == std::wstring::npos) return false;
     directory.resize(slash);
+
+    if (action == L"agent --config" || action == L"agent config") {
+        std::wstring launch = L"\"" + std::wstring(executable) + L"\" --agent-ui";
+        STARTUPINFOW startup = {};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process = {};
+        if (!CreateProcessW(executable, &launch[0], NULL, NULL, FALSE, 0,
+                            NULL, NULL, &startup, &process)) {
+            QueueOutput(L"Could not open Agent settings.\r\n");
+            return false;
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        QueueOutput(L"Opening Agent settings...\r\n");
+        return true;
+    }
 
     wchar_t override_path[MAX_PATH] = {};
     DWORD length = GetEnvironmentVariableW(L"Z0BDBG_AGENT_LAUNCHER", override_path, MAX_PATH);
@@ -5118,7 +5536,7 @@ bool GuiTerminalApp::HandleAgentCommand(const std::wstring& command) {
         QueueOutput(L"Agent launcher not found. Set Z0BDBG_AGENT_LAUNCHER.\r\n");
         return false;
     }
-    if (action == L"agent") {
+    if (action == L"agent --detach" || action == L"mcp server") {
         wchar_t plugin_override[MAX_PATH] = {};
         length = GetEnvironmentVariableW(L"Z0BDBG_MCP_PLUGIN", plugin_override, MAX_PATH);
         std::wstring plugin = length && length < MAX_PATH ? plugin_override : directory + L"\\Z0BDbgMcpBridge.dll";
@@ -5145,7 +5563,8 @@ bool GuiTerminalApp::HandleAgentCommand(const std::wstring& command) {
     }
     if (python.empty()) python = L"python.exe";
     std::wstring launch = L"\"" + python + L"\" \"" + script + L"\"";
-    if (action == L"agent config") launch += L" --configure";
+    if (action == L"mcp server") launch += L" --serve --port 3002";
+    else launch += L" --agent-exe \"" + std::wstring(executable) + L"\"";
     STARTUPINFOW startup = {};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process = {};
@@ -5156,8 +5575,8 @@ bool GuiTerminalApp::HandleAgentCommand(const std::wstring& command) {
     }
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
-    QueueOutput(action == L"agent" ? L"Opening Agent Terminal...\r\n"
-                                     : L"Opening Agent settings...\r\n");
+    QueueOutput(action == L"mcp server" ? L"Opening standalone MCP Server...\r\n" :
+        L"Opening detached Agent Terminal...\r\n");
     return true;
 }
 
@@ -5340,7 +5759,7 @@ void GuiTerminalApp::WorkerLoop() {
             {
                 std::unique_lock<std::mutex> lock(commandMutex_);
                 commandCv_.wait(lock, [&]() { return stopWorker_ || !commandQueue_.empty(); });
-                if (stopWorker_ && commandQueue_.empty()) {
+                if (stopWorker_) {
                     break;
                 }
                 command = commandQueue_.front();
@@ -5348,7 +5767,18 @@ void GuiTerminalApp::WorkerLoop() {
             }
 
             const std::wstring lower = ToLower(command);
-            if (lower == L"clear" || lower == L"cls" || lower == L"history" || IsQuitCommand(lower)) {
+            if (lower == L"clear" || lower == L"cls" || lower == L"history" ||
+                (!embeddedAgentMode_ && IsQuitCommand(lower))) {
+                continue;
+            }
+            if (embeddedAgentMode_) {
+                if (!HandleEmbeddedAgentInput(command)) {
+                    QueueOutput(L"Agent command failed.\r\n");
+                }
+                continue;
+            }
+            if (ToLower(Trim(command)) == L"mcp server") {
+                HandleAgentCommand(command);
                 continue;
             }
             if (ToLower(Trim(command)).rfind(L"agent", 0) == 0) {
@@ -5481,6 +5911,45 @@ LRESULT CALLBACK GuiTerminalApp::MainWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             app->UpdateTitleTabWindow();
             return result;
         }
+        case WM_APP_SET_AGENT_TITLE:
+            SetWindowTextW(hwnd, wParam ? kAgentWindowTitle : kSystemWindowTitle);
+            if (!wParam) {
+                KillTimer(hwnd, kAgentElapsedTimer);
+                app->agentUi_ = AgentEmbeddedUiState();
+                app->agentElapsedMs_ = 0;
+                app->agentAwaitingBreakpoint_ = false;
+                app->agentBreakpointRunSequence_ = 0;
+            }
+            {
+                RECT bounds = {};
+                GetClientRect(hwnd, &bounds);
+                app->Layout(bounds.right, bounds.bottom);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            app->RefreshInputHighlight();
+            return 0;
+        case WM_APP_AGENT_UI:
+            if (app->embeddedAgentMode_) app->ApplyAgentUi();
+            return 0;
+        case WM_TIMER:
+            if (wParam == kAgentElapsedTimer) {
+                if (app->embeddedAgentMode_ && app->agentAwaitingBreakpoint_) {
+                    const WdblDebuggerApi* api = app->debugger_.GetDebuggerApi();
+                    WdblStopInfo stop;
+                    if (api && api->getStopInfo && api->getStopInfo(api->context, &stop) && stop.paused) {
+                        std::wstring reason = ToLower(stop.reason);
+                        if (stop.exceptionCode == EXCEPTION_BREAKPOINT ||
+                            reason.find(L"breakpoint") != std::wstring::npos)
+                            ++app->agentObservedHits_;
+                        app->agentAwaitingBreakpoint_ = false;
+                    }
+                }
+                if (app->embeddedAgentMode_ && (app->agentUi_.working || app->agentAwaitingBreakpoint_))
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                else KillTimer(hwnd, kAgentElapsedTimer);
+                return 0;
+            }
+            break;
         case WM_CREATE:
             if (!app->CreateChildControls()) {
                 return -1;
@@ -5721,11 +6190,13 @@ LRESULT CALLBACK GuiTerminalApp::MainWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 FillRect(memDc, &rc, bg);
                 DeleteObject(bg);
                 app->PaintTitleBarTab(memDc, width);
+                app->PaintAgentPanel(memDc);
                 app->PaintCommandLinePrompt(memDc);
                 BitBlt(dc, 0, 0, width, height, memDc, 0, 0, SRCCOPY);
                 SelectObject(memDc, oldBitmap);
             } else {
                 app->PaintTitleBarTab(dc, width);
+                app->PaintAgentPanel(dc);
                 app->PaintCommandLinePrompt(dc);
             }
             if (memBitmap != nullptr) {
@@ -5775,6 +6246,10 @@ LRESULT CALLBACK GuiTerminalApp::MainWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             app->PaintOutputSelection();
             return 0;
         case WM_COMMAND:
+            if (reinterpret_cast<HWND>(lParam) == app->inputWnd_ && HIWORD(wParam) == EN_CHANGE) {
+                app->RefreshInputHighlight();
+                return 0;
+            }
             switch (LOWORD(wParam)) {
                 case ID_TITLE_MENU_SETTINGS:
                     MessageBoxW(
@@ -5867,6 +6342,7 @@ LRESULT CALLBACK GuiTerminalApp::MainWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             }
             return 0;
         case WM_CLOSE:
+            AgentEmbeddedCancel();
             app->DestroyTitleTabWindow();
             DestroyWindow(hwnd);
             return 0;
@@ -7909,6 +8385,7 @@ int GuiTerminalApp::Run() {
     }
 
     StopWorker();
+    AgentEmbeddedStop();
     RestoreStreams();
     pythonBridge_.Shutdown();
     debugger_.Shutdown();
@@ -7917,7 +8394,16 @@ int GuiTerminalApp::Run() {
 
 }  // namespace
 
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show) {
+    if (commandLine && (wcscmp(commandLine, L"--agent-ui") == 0 ||
+        wcscmp(commandLine, L"--chat-cli") == 0 ||
+        wcsncmp(commandLine, L"--chat-cli ", 11) == 0 ||
+        wcsncmp(commandLine, L"--agent-queue ", 14) == 0 ||
+        wcsncmp(commandLine, L"--agent-bench ", 14) == 0)) {
+        wchar_t emptyCommand[] = L"";
+        return AgentStandaloneMain(instance,
+            wcscmp(commandLine, L"--agent-ui") == 0 ? emptyCommand : commandLine, show);
+    }
     GuiTerminalApp app;
     return app.Run();
 }

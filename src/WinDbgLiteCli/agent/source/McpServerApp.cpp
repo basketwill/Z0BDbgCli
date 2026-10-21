@@ -1,9 +1,12 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <winsock2.h>
 #include <winhttp.h>
 #include <bcrypt.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #include <commctrl.h>
 #include <strsafe.h>
 #include <ctype.h>
@@ -40,6 +43,34 @@
 #include "AgentDebugWorkflow.h"
 #include "DebugRuntime.h"
 #include "McpServerResource.h"
+#ifdef WDBL_AGENT_EMBEDDED
+#include "AgentEmbedded.h"
+static AgentEmbeddedOutput g_embedded_activity_output = NULL;
+static void* g_embedded_activity_context = NULL;
+static std::wstring g_embedded_progress_state;
+static AgentEmbeddedUiUpdate g_embedded_ui_update = NULL;
+static AgentEmbeddedUiState g_embedded_ui_state;
+static HWND g_embedded_ui_owner = NULL;
+static ULONGLONG g_embedded_run_started = 0;
+static void EmbeddedPublishUi() {
+    if (g_embedded_ui_update)
+        g_embedded_ui_update(g_embedded_activity_context, g_embedded_ui_state);
+}
+static bool EmbeddedConfirm(const std::wstring& question, const wchar_t* title,
+    const std::wstring& operation) {
+    g_embedded_ui_state.approval = true;
+    g_embedded_ui_state.phase = L"Approval";
+    g_embedded_ui_state.detail = operation;
+    EmbeddedPublishUi();
+    const bool approved = MessageBoxW(g_embedded_ui_owner, question.c_str(), title,
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+    g_embedded_ui_state.approval = false;
+    g_embedded_ui_state.phase = approved ? L"Approved" : L"Declined";
+    EmbeddedPublishUi();
+    return approved;
+}
+#endif
+
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -47,7 +78,11 @@
 #pragma comment(lib, "bcrypt.lib")
 
 #define APP_NAME L"MCP Server"
+#ifdef WDBL_AGENT_EMBEDDED
+#define IDI_MCP_SERVER 101
+#else
 #define IDI_MCP_SERVER 1
+#endif
 
 #define IDC_NAME        1001
 #define IDC_VERSION     1002
@@ -820,6 +855,24 @@ static void GetConfigPath(wchar_t* path, size_t cch)
     wchar_t* slash = wcsrchr(path, L'\\');
     if (slash)
         slash[1] = L'\0';
+#ifdef WDBL_AGENT_EMBEDDED
+    StringCchCatW(path, cch, L"agent\\McpServer.ini");
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return;
+    GetModuleFileNameW(NULL, path, (DWORD)cch);
+    slash = wcsrchr(path, L'\\');
+    if (slash) slash[1] = L'\0';
+    StringCchCatW(path, cch, L"..\\..\\..\\..\\Z0BDbg\\agent\\McpServer.ini");
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return;
+    GetModuleFileNameW(NULL, path, (DWORD)cch);
+    slash = wcsrchr(path, L'\\');
+    if (slash) slash[1] = L'\0';
+    StringCchCatW(path, cch, L"..\\..\\..\\..\\..\\Z0BDbg\\agent\\McpServer.ini");
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return;
+    GetModuleFileNameW(NULL, path, (DWORD)cch);
+    slash = wcsrchr(path, L'\\');
+    if (slash) slash[1] = L'\0';
+    StringCchCatW(path, cch, L"agent\\");
+#endif
     StringCchCatW(path, cch, L"McpServer.ini");
 }
 
@@ -2152,6 +2205,12 @@ struct ConsoleTextStyleState {
 static void ConsoleWriteStyled(HANDLE output, const std::wstring& text,
     ConsoleTextStyleState* state, bool finish = false);
 
+#ifdef WDBL_AGENT_EMBEDDED
+static std::wstring EmbeddedStyledChunk(const std::wstring& text,
+    ConsoleTextStyleState* state, bool finish = false);
+static std::wstring EmbeddedStyledJson(const std::wstring& text);
+#endif
+
 struct ModelStreamContext {
     ModelStream stream;
     ChatJob* job;
@@ -2183,13 +2242,32 @@ static bool ModelStreamChunk(const char* data, size_t size, void* context)
             return false;
         }
     }
-    else if (job->console_output) {
+    else if (job->console_output
+#ifdef WDBL_AGENT_EMBEDDED
+        || g_embedded_activity_output
+#endif
+    ) {
         const std::string& content = state->stream.content;
         size_t valid = content.size();
         while (valid > state->printed &&
             !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                 content.data(), (int)valid, NULL, 0)) --valid;
         if (valid > state->printed) {
+#ifdef WDBL_AGENT_EMBEDDED
+            if (g_embedded_activity_output) {
+                if (!state->console_started) {
+                    g_embedded_activity_output(g_embedded_activity_context,
+                        L"\r\n  \x1b[38;2;126;206;149mASSISTANT\x1b[0m\r\n");
+                    state->console_started = true;
+                }
+                const std::wstring styled = EmbeddedStyledChunk(
+                    ChatWide(content.substr(state->printed, valid - state->printed)),
+                    &state->console_style);
+                if (!styled.empty())
+                    g_embedded_activity_output(g_embedded_activity_context, styled);
+            } else
+#endif
+            {
             if (!state->console_started) {
                 ConsoleWrite(job->console_output, L"\r\n  Assistant\r\n  ");
                 state->console_started = true;
@@ -2197,6 +2275,7 @@ static bool ModelStreamChunk(const char* data, size_t size, void* context)
             ConsoleWriteStyled(job->console_output,
                 ChatWide(content.substr(state->printed, valid - state->printed)),
                 &state->console_style);
+            }
             state->printed = valid;
         }
     }
@@ -2250,7 +2329,15 @@ static bool ModelRequest(const ServerConfig& cfg,
         success = RemoteHttpRequest(model_cfg, body, &raw, &status, false,
             &retry_after, cfg.stream_output ? ModelStreamChunk : NULL,
             cfg.stream_output ? &stream : NULL, true, job);
-        if (stream.console_started)
+#ifdef WDBL_AGENT_EMBEDDED
+        if (stream.console_started && g_embedded_activity_output) {
+            const std::wstring tail = EmbeddedStyledChunk(L"", &stream.console_style, true);
+            if (!tail.empty()) g_embedded_activity_output(g_embedded_activity_context, tail);
+            if (!stream.stream.content.empty() && stream.stream.content.back() != '\n')
+                g_embedded_activity_output(g_embedded_activity_context, L"\r\n");
+        }
+#endif
+        if (stream.console_started && job->console_output)
             ConsoleWriteStyled(job->console_output, L"", &stream.console_style, true);
         g_service_health.finish(service, GetTickCount(), success,
             !AgentJobCancelled(job) && (status == 0 || status == 429 || status >= 500));
@@ -2336,6 +2423,14 @@ static void AgentModelEvent(ChatJob* job, const std::string& text)
     if (g_terminal_ui)
         g_terminal_ui->activity(ChatWide(safe));
     if (job->console_output) ConsoleWrite(job->console_output, L"\r\n  " + ChatWide(safe) + L"\r\n");
+#ifdef WDBL_AGENT_EMBEDDED
+    if (g_embedded_activity_output) {
+        ConsoleTextStyleState style;
+        g_embedded_activity_output(g_embedded_activity_context,
+            L"  \x1b[38;2;88;205;218mMODEL\x1b[0m  " +
+            EmbeddedStyledChunk(ChatWide(safe), &style, true) + L"\r\n");
+    }
+#endif
 }
 
 static std::vector<AgentRouteCandidate> AgentRouteCandidates(const ServerConfig& cfg, const std::wstring& prompt,
@@ -2724,6 +2819,12 @@ static bool AgentRequest(ChatJob* job, const std::vector<std::string>& messages,
                 job->answer = error;
                 return false;
             }
+#ifdef WDBL_AGENT_EMBEDDED
+            if (g_embedded_activity_output) {
+                g_embedded_ui_state.model = cfg.model_name;
+                EmbeddedPublishUi();
+            }
+#endif
             if (round == 0 || attempt > 0)
                 AgentModelEvent(job, std::string(attempt > 0 ? "Failover: " : "Model: ") + WideToUtf8(cfg.model_name));
             job->streamed_round = -1;
@@ -2879,6 +2980,11 @@ static bool ConfirmAgentOperation(ChatJob* job, const ModelToolBinding& binding,
     }
     if (job->hwnd) return MessageBoxW(job->hwnd, question.c_str(), L"Confirm MCP operation",
         MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+#ifdef WDBL_AGENT_EMBEDDED
+    if (g_embedded_ui_update) {
+        return EmbeddedConfirm(question, L"Confirm Agent operation", ChatWide(binding.mcp_name));
+    }
+#endif
     return false;
 }
 
@@ -3447,6 +3553,20 @@ static void TaskEvent(ChatJob* job, const std::string& raw)
     RecordTaskTimeline(&job->task, AgentUtc(), "task", TaskCurrentStep(job->task), job->active_model, text);
     UpdateAgentTaskPanel(job->task);
     if (job->console_output) ConsoleWrite(job->console_output, L"\r\n  Task: " + ChatWide(text) + L"\r\n");
+#ifdef WDBL_AGENT_EMBEDDED
+    if (g_embedded_activity_output) {
+        g_embedded_ui_state.task = ChatWide(job->task.title.empty() ? job->task.goal : job->task.title);
+        g_embedded_ui_state.task_state = ChatWide(job->task.state);
+        g_embedded_ui_state.steps = static_cast<int>(job->task.steps.size());
+        const int current = TaskCurrentStep(job->task);
+        g_embedded_ui_state.step = current < 0 ? g_embedded_ui_state.steps : current + 1;
+        g_embedded_ui_state.current_step = current >= 0 ?
+            ChatWide(job->task.steps[current].title) : L"";
+        EmbeddedPublishUi();
+        g_embedded_activity_output(g_embedded_activity_context,
+            L"  \x1b[38;2;232;198;116mSTEP\x1b[0m   " + ChatWide(text) + L"\r\n");
+    }
+#endif
     if (job->hwnd) {
         std::string* update = new std::string(text);
         if (!PostMessageW(job->hwnd, WM_TASK_EVENT, 0, (LPARAM)update)) delete update;
@@ -3458,13 +3578,39 @@ static void TaskEvent(ChatJob* job, const std::string& raw)
 static void AgentWorkingProgress(ChatJob* job, const wchar_t* phase,
     const std::wstring& detail)
 {
-    if (!g_terminal_ui) return;
     int step = job->task_enabled ? TaskCurrentStep(job->task) : -1;
     int total = job->task_enabled ? (int)job->task.steps.size() : 0;
     std::wstring visible = detail;
     if (step >= 0 && job->task.steps[step].status == "verifying")
         visible += L" | Verifying " + ChatWide(job->task.steps[step].title);
-    g_terminal_ui->progress(phase, visible, total ? (step < 0 ? total : step + 1) : 0, total);
+    if (g_terminal_ui)
+        g_terminal_ui->progress(phase, visible, total ? (step < 0 ? total : step + 1) : 0, total);
+#ifdef WDBL_AGENT_EMBEDDED
+    if (g_embedded_activity_output) {
+        UpdateAgentTaskPanel(job->task);
+        g_embedded_ui_state.phase = phase;
+        g_embedded_ui_state.detail = visible;
+        g_embedded_ui_state.step = total ? (step < 0 ? total : step + 1) : 0;
+        g_embedded_ui_state.steps = total;
+        g_embedded_ui_state.current_step = step >= 0 ?
+            ChatWide(job->task.steps[step].title) : L"";
+        EmbeddedPublishUi();
+        std::wstring state = phase;
+        if (total) state += L" " + std::to_wstring(step < 0 ? total : step + 1) +
+            L"/" + std::to_wstring(total);
+        state += L"  " + visible;
+        if (state != g_embedded_progress_state) {
+            g_embedded_progress_state = state;
+            g_embedded_activity_output(g_embedded_activity_context,
+                std::wstring(L"  \x1b[38;2;232;198;116mACTIVE\x1b[0m ") +
+                L"\x1b[38;2;88;205;218m" + std::wstring(phase) + L"\x1b[0m" +
+                (total ? std::wstring(L"  \x1b[38;2;232;198;116m") +
+                    std::to_wstring(step < 0 ? total : step + 1) + L"/" +
+                    std::to_wstring(total) + L"\x1b[0m" : L"") +
+                L"  " + visible + L"\r\n");
+        }
+    }
+#endif
 }
 
 static bool TaskQuery(ChatJob* job, const std::string& instruction, const std::string& data,
@@ -4107,6 +4253,13 @@ static bool SampleBreakpointHits(ChatJob* job, const std::string& arguments,
     std::string hits = "[", reason = "max_hits";
     unsigned count = 0;
     if (g_terminal_ui) g_terminal_ui->progressHits(0, (int)max_hits);
+#ifdef WDBL_AGENT_EMBEDDED
+    if (g_embedded_ui_update) {
+        g_embedded_ui_state.hits = 0;
+        g_embedded_ui_state.hit_target = static_cast<int>(max_hits);
+        EmbeddedPublishUi();
+    }
+#endif
     for (; count < max_hits; ) {
         if (AgentJobCancelled(job)) { reason = "interrupted"; break; }
         if (GetTickCount() - started >= timeout_seconds * 1000) { reason = "timeout"; break; }
@@ -4186,6 +4339,12 @@ static bool SampleBreakpointHits(ChatJob* job, const std::string& arguments,
             }
             if (count++) hits += ',';
             if (g_terminal_ui) g_terminal_ui->progressHits((int)count, (int)max_hits);
+#ifdef WDBL_AGENT_EMBEDDED
+            if (g_embedded_ui_update) {
+                g_embedded_ui_state.hits = static_cast<int>(count);
+                EmbeddedPublishUi();
+            }
+#endif
             hits += "{\"index\":" + TaskNumber(count) + ",\"cursor\":" + cursor->raw +
                 ",\"stop\":" + stop->raw + "}";
             RecordTaskTimeline(&job->task, AgentUtc(), "observation",
@@ -5001,6 +5160,17 @@ static bool RunChatCore(ChatJob* job)
             const std::string& mcp_name = mcp_names[i];
             std::string result;
             job->calls.push_back(mcp_name + " " + call.arguments_json);
+#ifdef WDBL_AGENT_EMBEDDED
+            if (g_embedded_activity_output) {
+                const std::string safe_arguments = AgentRedactText(call.arguments_json,
+                    AgentKnownSecrets(job->cfg));
+                g_embedded_activity_output(g_embedded_activity_context,
+                    std::wstring(L"  \x1b[38;2;88;205;218mTOOL\x1b[0m   ") +
+                    L"\x1b[38;2;157;207;216m" + ChatWide(mcp_name) + L"\x1b[0m\r\n" +
+                    L"         \x1b[38;2;146;154;163margs\x1b[0m   " +
+                    EmbeddedStyledJson(ChatWide(ContextExcerpt(safe_arguments, 320))) + L"\r\n");
+            }
+#endif
             if (job->console_output) {
                 ConsoleWriteColor(job->console_output,
                     FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY, L"\r\n  tool  ");
@@ -5044,6 +5214,14 @@ static bool RunChatCore(ChatJob* job)
                 else if (!ExecuteDebugPython(job, bindings, call.arguments_json, &result, &dispatched)) return false;
             } else if (!ExecuteAgentTool(job, *binding, call.arguments_json, request, "100", &result, &dispatched)) {
                 ConsoleWriteToolReceipt(job, mcp_name, false, GetTickCount() - tool_started);
+#ifdef WDBL_AGENT_EMBEDDED
+                if (g_embedded_activity_output)
+                    g_embedded_activity_output(g_embedded_activity_context,
+                        std::wstring(L"  \x1b[38;2;224;120;112mFAIL\x1b[0m   ") +
+                        L"\x1b[38;2;157;207;216m" + ChatWide(mcp_name) + L"\x1b[0m\r\n" +
+                        L"         " + ChatWide(ContextExcerpt(AgentRedactText(job->answer,
+                            AgentKnownSecrets(job->cfg)), 320)) + L"\r\n");
+#endif
                 if (!job->answer.empty()) ConsoleWriteAgentDetail(job, L"  error  ", job->answer, 2048);
                 if (g_terminal_ui) g_terminal_ui->activity(L"Tool failed: " + ChatWide(mcp_name));
                 return false;
@@ -5062,6 +5240,20 @@ static bool RunChatCore(ChatJob* job)
             if (job->chat_recovery_verify && read_only && tool_succeeded)
                 job->chat_recovery_observed = true;
             ConsoleWriteToolReceipt(job, mcp_name, tool_succeeded, GetTickCount() - tool_started);
+#ifdef WDBL_AGENT_EMBEDDED
+            if (g_embedded_activity_output) {
+                const std::string safe_result = AgentRedactText(result,
+                    AgentKnownSecrets(job->cfg));
+                g_embedded_activity_output(g_embedded_activity_context,
+                    std::wstring(L"  ") + (tool_succeeded ? L"\x1b[38;2;126;206;149mOK\x1b[0m" :
+                        L"\x1b[38;2;224;120;112mFAIL\x1b[0m") + L"     " +
+                    L"\x1b[38;2;157;207;216m" + ChatWide(mcp_name) + L"\x1b[0m  " +
+                    L"\x1b[38;2;232;198;116m" +
+                    std::to_wstring(GetTickCount() - tool_started) + L" ms\x1b[0m\r\n" +
+                    L"         \x1b[38;2;146;154;163mresult\x1b[0m " +
+                    EmbeddedStyledJson(ChatWide(ContextExcerpt(safe_result, 1200))) + L"\r\n");
+            }
+#endif
             result = ModelVisibleToolResult(result, (size_t)job->cfg.tool_result_kb * 1024);
             ConsoleWriteAgentDetail(job, L"  \x2514\x2500 result  ", result, 8192);
             if (step_index >= 0) {
@@ -5206,7 +5398,8 @@ static bool RunChatCore(ChatJob* job)
 
 static bool PrepareTaskRecordPath(ChatJob* job)
 {
-    if (!job->task_record_path.empty() || (!job->hwnd && !job->console_output)) return true;
+    if (!job->task_record_path.empty() ||
+        (!job->hwnd && !job->console_output && job->chat_history_path.empty())) return true;
     std::wstring directory = AgentTaskFolder(job->cfg);
     if (directory.empty()) return false;
     job->task_record_path = directory + L"\\" + ChatWide(job->task.id) + L".json";
@@ -6699,9 +6892,32 @@ static std::wstring ChatWide(const std::string& utf8)
 
 static void UpdateAgentTaskPanel(const AgentTask& task)
 {
-    if (!g_terminal_ui) return; std::vector<std::wstring> rows;
+    std::vector<std::wstring> rows;
+    const int current = TaskCurrentStep(task);
+#ifdef WDBL_AGENT_EMBEDDED
+    if (g_embedded_ui_update) {
+        if (!task.title.empty() || !task.goal.empty())
+            g_embedded_ui_state.task = ChatWide(task.title.empty() ? task.goal : task.title);
+        g_embedded_ui_state.task_state = ChatWide(task.state);
+        g_embedded_ui_state.steps = static_cast<int>(task.steps.size());
+        g_embedded_ui_state.step = current < 0 ? g_embedded_ui_state.steps : current + 1;
+        g_embedded_ui_state.current_step_index = current;
+        g_embedded_ui_state.current_step = current < 0 ? L"" :
+            ChatWide(task.steps[current].title);
+        g_embedded_ui_state.task_steps.clear();
+        for (size_t i = 0; i < task.steps.size(); ++i) {
+            AgentEmbeddedStep row;
+            row.title = ChatWide(task.steps[i].title);
+            row.status = ChatWide(task.steps[i].status);
+            row.model_slot = task.steps[i].actual_model >= 0 ?
+                task.steps[i].actual_model : task.steps[i].assigned_model;
+            g_embedded_ui_state.task_steps.push_back(row);
+        }
+        EmbeddedPublishUi();
+    }
+#endif
+    if (!g_terminal_ui) return;
     if (!task.steps.empty()) {
-        int current = TaskCurrentStep(task);
         std::wstring progress = L"  " + ChatWide(task.title) + L"  [" + ChatWide(task.state) + L"]";
         progress += L"  steps " + ChatWide(TaskNumber((int)task.steps.size()));
         if (current >= 0)
@@ -6756,8 +6972,21 @@ static bool ConsoleReadPrompt(HANDLE input, HANDLE output,
     const std::wstring& status, std::wstring* line, bool hidden = false,
     TerminalInputHistory* input_history = NULL);
 
+#ifdef WDBL_AGENT_EMBEDDED
+static int g_embedded_style_sink_tag;
+static thread_local std::wstring* g_embedded_style_sink = NULL;
+static HANDLE EmbeddedStyleSinkHandle() { return &g_embedded_style_sink_tag; }
+#endif
+
 static bool ConsoleWrite(HANDLE output, const std::wstring& text)
 {
+#ifdef WDBL_AGENT_EMBEDDED
+    if (output == EmbeddedStyleSinkHandle()) {
+        if (!g_embedded_style_sink) return false;
+        *g_embedded_style_sink += text;
+        return true;
+    }
+#endif
     if (g_terminal_ui && g_terminal_ui->owns(output)) {
         g_terminal_ui->append(text, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
         return true;
@@ -6793,6 +7022,21 @@ static bool CopyTerminalText(const std::wstring& text)
 
 static void ConsoleWriteColor(HANDLE output, WORD color, const std::wstring& text)
 {
+#ifdef WDBL_AGENT_EMBEDDED
+    if (output == EmbeddedStyleSinkHandle()) {
+        if (!g_embedded_style_sink) return;
+        const bool bright = (color & FOREGROUND_INTENSITY) != 0;
+        const int on = bright ? 224 : 174;
+        const int off = bright ? 88 : 0;
+        const int red = color & FOREGROUND_RED ? on : off;
+        const int green = color & FOREGROUND_GREEN ? on : off;
+        const int blue = color & FOREGROUND_BLUE ? on : off;
+        *g_embedded_style_sink += L"\x1b[38;2;" + std::to_wstring(red) + L";" +
+            std::to_wstring(green) + L";" + std::to_wstring(blue) + L"m" +
+            text + L"\x1b[0m";
+        return;
+    }
+#endif
     if (g_terminal_ui && g_terminal_ui->owns(output)) {
         g_terminal_ui->append(text, color);
         return;
@@ -7426,6 +7670,29 @@ static void ConsoleWriteStyled(HANDLE output, const std::wstring& text,
     }
 }
 
+#ifdef WDBL_AGENT_EMBEDDED
+static std::wstring EmbeddedStyledChunk(const std::wstring& text,
+    ConsoleTextStyleState* state, bool finish)
+{
+    std::wstring result;
+    std::wstring* previous = g_embedded_style_sink;
+    g_embedded_style_sink = &result;
+    ConsoleWriteStyled(EmbeddedStyleSinkHandle(), text, state, finish);
+    g_embedded_style_sink = previous;
+    return result;
+}
+
+static std::wstring EmbeddedStyledJson(const std::wstring& text)
+{
+    std::wstring result;
+    std::wstring* previous = g_embedded_style_sink;
+    g_embedded_style_sink = &result;
+    ConsoleWriteCodeLine(EmbeddedStyleSinkHandle(), text, true);
+    g_embedded_style_sink = previous;
+    return result;
+}
+#endif
+
 static void ConsoleWriteHelp(HANDLE output, const std::wstring& text)
 {
     size_t plain = 0;
@@ -7701,7 +7968,8 @@ static void ReadMemoryFolder(const std::string& project, std::vector<AgentMemory
     std::wstring directory = AgentDataFolder(L"memory", project);
     if (directory.empty()) return;
     WIN32_FIND_DATAW found;
-    HANDLE search = FindFirstFileW((directory + L"\\*.json").c_str(), &found);
+    HANDLE search = directory.empty() ? INVALID_HANDLE_VALUE :
+        FindFirstFileW((directory + L"\\*.json").c_str(), &found);
     if (search == INVALID_HANDLE_VALUE) return;
     int scanned = 0;
     do {
@@ -12715,7 +12983,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
-int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR command_line, int show)
+int AgentStandaloneMain(HINSTANCE instance, LPWSTR command_line, int show)
 {
     g_instance = instance;
     g_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
@@ -12837,3 +13105,1553 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR command_line, int sh
     CloseAgentHttpSession();
     return (int)msg.wParam;
 }
+#ifdef WDBL_AGENT_EMBEDDED
+namespace {
+const WdblDebuggerApi* g_embedded_api = NULL;
+AgentEmbeddedOutput g_embedded_output = NULL;
+void* g_embedded_context = NULL;
+HWND g_embedded_owner = NULL;
+bool g_embedded_initialized = false;
+volatile LONG g_embedded_cancel_requested = 0;
+std::vector<std::string> g_embedded_history;
+bool g_embedded_session_has_chat = false;
+AgentTask g_embedded_task;
+std::wstring g_embedded_task_path;
+std::wstring g_embedded_skill;
+std::string g_embedded_skill_text;
+AgentEvaluation g_embedded_evaluation;
+std::wstring g_embedded_evaluation_path;
+std::string g_embedded_description;
+int g_embedded_active_model = 0;
+int g_embedded_requested_model = 0;
+
+template<typename Handler>
+bool EmbeddedConsoleOutput(Handler handler) {
+    wchar_t folder[MAX_PATH] = {}, path[MAX_PATH] = {};
+    if (!GetTempPathW(_countof(folder), folder) ||
+        !GetTempFileNameW(folder, L"zba", 0, path)) return false;
+    HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+    if (file == INVALID_HANDLE_VALUE) { DeleteFileW(path); return false; }
+    bool handled = handler(file);
+    LARGE_INTEGER start = {};
+    SetFilePointerEx(file, start, NULL, FILE_BEGIN);
+    std::string bytes;
+    char buffer[4096]; DWORD read = 0;
+    while (bytes.size() < 256 * 1024 && ReadFile(file, buffer,
+        static_cast<DWORD>((std::min)(sizeof(buffer), 256 * 1024 - bytes.size())), &read, NULL) && read)
+        bytes.append(buffer, read);
+    CloseHandle(file);
+    DeleteFileW(path);
+    if (!bytes.empty()) g_embedded_output(g_embedded_context, ChatWide(bytes));
+    return handled;
+}
+
+std::wstring EmbeddedFormatAnswer(const std::wstring& answer) {
+    ConsoleTextStyleState state;
+    return EmbeddedStyledChunk(answer, &state, true);
+}
+
+void EmbeddedShowStatus(const ServerConfig& cfg, const std::string& task) {
+    g_embedded_ui_state.model = cfg.model_name;
+    EmbeddedPublishUi();
+    std::wstring description = task.empty() ? L"(none)" : ChatWide(task);
+    g_embedded_output(g_embedded_context,
+        L"\r\n  \x1b[38;2;88;205;218mAGENT\x1b[0m  "
+        L"\x1b[38;2;146;154;163mmodel\x1b[0m " + std::wstring(cfg.model_name) +
+        L"\r\n         \x1b[38;2;146;154;163mtask\x1b[0m  " + description + L"\r\n");
+}
+
+std::string EmbeddedNumber(unsigned __int64 value) {
+    return std::to_string(value);
+}
+
+void EmbeddedField(std::string* json, const char* name, const std::string& value) {
+    *json += ",\"" + std::string(name) + "\":";
+    ModelJson::quote(json, value);
+}
+
+bool EmbeddedUnsigned(const ModelJson* value, uint64_t* number) {
+    if (!value || value->kind != ModelJson::NUMBER || value->raw.empty() || !number) return false;
+    uint64_t parsed = 0;
+    for (size_t i = 0; i < value->raw.size(); ++i) {
+        const char ch = value->raw[i];
+        if (ch < '0' || ch > '9') return false;
+        const uint64_t digit = static_cast<uint64_t>(ch - '0');
+        if (parsed > (static_cast<uint64_t>(-1) - digit) / 10) return false;
+        parsed = parsed * 10 + digit;
+    }
+    *number = parsed;
+    return true;
+}
+
+bool EmbeddedHexBytes(const std::string& hex, std::vector<unsigned char>* bytes) {
+    if (!bytes || hex.empty() || hex.size() > 512 || (hex.size() & 1)) return false;
+    bytes->clear();
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        int value = 0;
+        for (size_t j = i; j < i + 2; ++j) {
+            const char ch = hex[j];
+            const int digit = ch >= '0' && ch <= '9' ? ch - '0' :
+                ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 :
+                ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+            if (digit < 0) return false;
+            value = value * 16 + digit;
+        }
+        bytes->push_back(static_cast<unsigned char>(value));
+    }
+    return true;
+}
+
+std::string EmbeddedContext() {
+    WdblStopInfo stop;
+    bool active = g_embedded_api && g_embedded_api->getStopInfo &&
+        g_embedded_api->getStopInfo(g_embedded_api->context, &stop) != 0;
+    DWORD pid = active ? stop.processId : 0;
+    DWORD tid = active ? stop.threadId : 0;
+    if (!pid && g_embedded_api && g_embedded_api->getThreadCount && g_embedded_api->getThreadInfo) {
+        uint32_t count = 0;
+        WdblThreadInfo thread;
+        if (g_embedded_api->getThreadCount(g_embedded_api->context, &count) && count &&
+            g_embedded_api->getThreadInfo(g_embedded_api->context, 0, &thread)) {
+            pid = thread.processId;
+            tid = thread.threadId;
+        }
+    }
+    unsigned __int64 creation = 0;
+    if (pid) {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        FILETIME created = {}, exited = {}, kernel = {}, user = {};
+        if (process) {
+            if (GetProcessTimes(process, &created, &exited, &kernel, &user))
+                creation = (static_cast<unsigned __int64>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+            CloseHandle(process);
+        }
+    }
+    std::string session = EmbeddedNumber(pid) + ":" + EmbeddedNumber(creation);
+    std::string revision = session + ":" + EmbeddedNumber(tid) + ":" +
+        EmbeddedNumber(active ? stop.instructionPointer : 0) + ":" + EmbeddedNumber(active ? stop.exceptionCode : 0) +
+        ":" + EmbeddedNumber(active ? stop.paused : 0);
+    std::string json = "{\"process_id\":" + EmbeddedNumber(pid) +
+        ",\"thread_id\":" + EmbeddedNumber(tid) +
+        ",\"status\":" + EmbeddedNumber(!pid ? 20 : active && stop.paused ? 18 : 19) +
+        ",\"sequence\":0,\"paused\":" + (active && stop.paused ? "true" : "false");
+    if (active) {
+        json += ",\"instruction_pointer\":" + EmbeddedNumber(stop.instructionPointer) +
+            ",\"exception_code\":" + EmbeddedNumber(stop.exceptionCode) +
+            ",\"exception_address\":" + EmbeddedNumber(stop.exceptionAddress) +
+            ",\"first_chance\":" + (stop.firstChance ? "true" : "false");
+    }
+    EmbeddedField(&json, "session", session);
+    EmbeddedField(&json, "revision", revision);
+    if (active) EmbeddedField(&json, "reason", WideToUtf8(stop.reason));
+    return json + "}";
+}
+
+bool EmbeddedToolsList(const ServerConfig&, std::string* response, bool) {
+    if (!response) return true;
+    *response = "{\"tools\":["
+        "{\"name\":\"get_debug_context\",\"description\":\"Read current target identity and stop state\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"get_status\",\"description\":\"Read debugger status\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"thread_list\",\"description\":\"List target threads\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"register_get\",\"description\":\"Read registers for a zero-based thread index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"index\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"index\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"stack_get_pointers\",\"description\":\"Read up to 32 stack frames for a zero-based thread index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"index\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"index\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"module_list\",\"description\":\"List loaded modules\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"breakpoint_list\",\"description\":\"List breakpoints\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"read_memory\",\"description\":\"Read up to 4096 target bytes as hex\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"address\":{\"type\":\"integer\",\"minimum\":0},\"size\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":4096}},\"required\":[\"address\",\"size\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"resolve_symbol\",\"description\":\"Resolve an address to a symbol\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"address\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"address\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"resolve_expression\",\"description\":\"Resolve a debugger address expression\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"expression\":{\"type\":\"string\"}},\"required\":[\"expression\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"get_symbol_path\",\"description\":\"Read the symbol search path\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"debug_open_process\",\"description\":\"Launch a target executable in this debugger\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"arguments\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"debug_attach_pid\",\"description\":\"Attach this debugger to a process ID\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"pid\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"pid\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"run\",\"description\":\"Continue the target\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"step_into\",\"description\":\"Single-step the target\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"step_over\",\"description\":\"Step over the next instruction\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"set_software_breakpoint\",\"description\":\"Add a software breakpoint\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"address\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"address\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"delete_software_breakpoint\",\"description\":\"Remove a breakpoint by ID\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"id\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"select_thread\",\"description\":\"Select a zero-based thread index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"index\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"index\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"enable_breakpoint\",\"description\":\"Enable a breakpoint by ID\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"id\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"disable_breakpoint\",\"description\":\"Disable a breakpoint by ID\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"id\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"debug_detach\",\"description\":\"Detach from the target process\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"set_breakpoint_condition\",\"description\":\"Set a breakpoint condition\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":0},\"expression\":{\"type\":\"string\"}},\"required\":[\"id\",\"expression\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"clear_breakpoint_condition\",\"description\":\"Clear a breakpoint condition\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"id\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"set_symbol_path\",\"description\":\"Set the symbol search path\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"load_symbols\",\"description\":\"Load symbols for all modules or a target module\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"}},\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"set_register\",\"description\":\"Set a register using name=value\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"assignment\":{\"type\":\"string\"}},\"required\":[\"assignment\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"write_memory_patch\",\"description\":\"Write up to 256 bytes as a reversible memory patch\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"address\":{\"type\":\"integer\",\"minimum\":0},\"hex\":{\"type\":\"string\",\"minLength\":2,\"maxLength\":512}},\"required\":[\"address\",\"hex\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"undo_memory_patch\",\"description\":\"Undo recent memory patches\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"count\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64}},\"required\":[\"count\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"thread_get\",\"description\":\"Read details for a zero-based thread index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"index\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"index\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"module_get\",\"description\":\"Read details for a zero-based module index\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"index\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"index\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"breakpoint_get\",\"description\":\"Read details for a zero-based breakpoint list index (kind: 0 software, 1 hardware, 2 memory)\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"index\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"index\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":true}},"
+        "{\"name\":\"set_hardware_breakpoint\",\"description\":\"Set a hardware breakpoint (access: x, w, rw)\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"address\":{\"type\":\"integer\",\"minimum\":1},\"slot\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":3},\"access\":{\"type\":\"string\",\"enum\":[\"x\",\"w\",\"rw\"]},\"length\":{\"type\":\"integer\",\"enum\":[1,2,4,8]},\"thread_id\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"address\",\"slot\",\"access\",\"length\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}},"
+        "{\"name\":\"set_memory_breakpoint\",\"description\":\"Set a guard-page memory breakpoint (access: r, w, x or combinations)\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"address\":{\"type\":\"integer\",\"minimum\":1},\"size\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1048576},\"access\":{\"type\":\"string\",\"enum\":[\"r\",\"w\",\"x\",\"rw\",\"rx\",\"wx\",\"rwx\"]}},\"required\":[\"address\",\"size\",\"access\"],\"additionalProperties\":false},\"annotations\":{\"readOnlyHint\":false}}]}";
+    struct ExtraTool { const char* name; const char* description; const char* schema; bool read_only; };
+    static const char* empty = R"({"type":"object","additionalProperties":false})";
+    static const char* name = R"({"type":"object","properties":{"name":{"type":"string","minLength":1}},"required":["name"],"additionalProperties":false})";
+    static const char* process_name = R"({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":260}},"required":["name"],"additionalProperties":false})";
+    static const char* path = R"({"type":"object","properties":{"path":{"type":"string","minLength":1}},"required":["path"],"additionalProperties":false})";
+    static const char* line = R"({"type":"object","properties":{"line":{"type":"integer","minimum":1}},"required":["line"],"additionalProperties":false})";
+    static const char* scope = R"({"type":"object","properties":{"scope":{"type":"integer","minimum":0,"maximum":2}},"required":["scope"],"additionalProperties":false})";
+    static const char* scope_enabled = R"({"type":"object","properties":{"scope":{"type":"integer","minimum":0,"maximum":2},"enabled":{"type":"boolean"}},"required":["scope","enabled"],"additionalProperties":false})";
+    static const char* scope_code = R"({"type":"object","properties":{"scope":{"type":"integer","minimum":0,"maximum":2},"code":{"type":"integer","minimum":0,"maximum":4294967295}},"required":["scope","code"],"additionalProperties":false})";
+    static const char* expression = R"({"type":"object","properties":{"expression":{"type":"string","minLength":1}},"required":["expression"],"additionalProperties":false})";
+    static const char* index = R"({"type":"object","properties":{"index":{"type":"integer","minimum":1}},"required":["index"],"additionalProperties":false})";
+    static const char* condition = R"({"type":"object","properties":{"condition":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":100000}},"required":["condition","limit"],"additionalProperties":false})";
+    static const char* repeat = R"({"type":"object","properties":{"count":{"type":"integer","minimum":1,"maximum":1000},"delay_ms":{"type":"integer","minimum":0,"maximum":1000}},"required":["count","delay_ms"],"additionalProperties":false})";
+    static const char* download = R"({"type":"object","properties":{"target":{"type":"string","minLength":1},"cache_dir":{"type":"string"},"server_url":{"type":"string"}},"required":["target"],"additionalProperties":false})";
+    static const char* memory = R"({"type":"object","properties":{"address":{"type":"integer","minimum":0},"hex":{"type":"string","minLength":2,"maxLength":512}},"required":["address","hex"],"additionalProperties":false})";
+    static const char* command = R"({"type":"object","properties":{"command":{"type":"string","minLength":1}},"required":["command"],"additionalProperties":false})";
+    static const char* disassembly = R"({"type":"object","properties":{"address":{"type":"integer","minimum":1},"count":{"type":"integer","minimum":1,"maximum":64}},"required":["address","count"],"additionalProperties":false})";
+    static const char* search = R"({"type":"object","properties":{"address":{"type":"integer","minimum":0},"size":{"type":"integer","minimum":1,"maximum":65536},"hex":{"type":"string","minLength":2,"maxLength":512},"max_results":{"type":"integer","minimum":1,"maximum":64}},"required":["address","size","hex"],"additionalProperties":false})";
+    static const char* restore = R"({"type":"object","properties":{"name":{"type":"string","minLength":1},"rerun":{"type":"boolean"}},"required":["name"],"additionalProperties":false})";
+    const ExtraTool extra[] = {
+        {"debug_find_process", "Find a running process by executable name and return its PID and path; use before debug_attach_pid", process_name, true},
+        {"save_stop_snapshot", "Save the current stop snapshot", empty, false},
+        {"save_named_snapshot", "Save a named snapshot", name, false},
+        {"restore_named_snapshot", "Restore a named snapshot", restore, false},
+        {"list_named_snapshots", "List named snapshots", empty, true},
+        {"step_back_snapshot", "Restore the previous stop snapshot", empty, false},
+        {"add_source_root", "Add a source search directory", path, false},
+        {"remove_source_root", "Remove a source search directory", path, false},
+        {"clear_source_roots", "Clear source search directories", empty, false},
+        {"list_source_roots", "List source search directories", empty, true},
+        {"load_script_file", "Load a debugger script file", path, false},
+        {"set_script_breakpoint", "Set a script line breakpoint", line, false},
+        {"remove_script_breakpoint", "Remove a script line breakpoint", line, false},
+        {"list_script_breakpoints", "List script breakpoints", empty, true},
+        {"set_exception_ignore_all", "Configure ignore-all for exception scope (0 debugging, 1 runtime, 2 stepping)", scope_enabled, false},
+        {"add_ignored_exception", "Ignore an exception code in a scope", scope_code, false},
+        {"remove_ignored_exception", "Stop ignoring an exception code in a scope", scope_code, false},
+        {"clear_ignored_exceptions", "Clear ignored exception codes in a scope", scope, false},
+        {"list_exception_settings", "List exception settings", empty, true},
+        {"add_run_stop_expression", "Add a run-stop expression", expression, false},
+        {"remove_run_stop_expression", "Remove a run-stop expression by one-based index", index, false},
+        {"clear_run_stop_expressions", "Clear run-stop expressions", empty, false},
+        {"list_run_stop_expressions", "List run-stop expressions", empty, true},
+        {"step_until_condition", "Step until a condition or step limit", condition, false},
+        {"run_until_condition", "Run until a condition or pause limit", condition, false},
+        {"auto_step", "Repeat single steps with delay", repeat, false},
+        {"auto_run", "Repeat runs with delay", repeat, false},
+        {"download_symbols", "Download symbols for a target module", download, false},
+        {"write_memory", "Write raw target memory bytes without patch history", memory, false},
+        {"execute_debugger_command", "Execute a native CLI debugger command and return its output", command, false}
+        ,{"disassemble", "Decode up to 64 target instructions with addresses, bytes and text", disassembly, true}
+        ,{"find_memory", "Find exact bytes within a bounded target memory range", search, true}
+    };
+    response->resize(response->size() - 2);
+    for (size_t i = 0; i < _countof(extra); ++i) {
+        *response += ",{\"name\":";
+        ModelJson::quote(response, extra[i].name);
+        *response += ",\"description\":";
+        ModelJson::quote(response, extra[i].description);
+        *response += ",\"inputSchema\":";
+        *response += extra[i].schema;
+        *response += ",\"annotations\":{\"readOnlyHint\":";
+        *response += extra[i].read_only ? "true}}" : "false}}";
+    }
+    *response += "]}";
+    return true;
+}
+
+bool EmbeddedToolCall(const ServerConfig&, const std::string& request, const std::string&, std::string* response) {
+    ModelJson root;
+    if (!g_embedded_api || !response || !ModelJson::parse(request, &root)) return false;
+    const ModelJson* params = root.get("params");
+    const ModelJson* tool = params ? params->get("name") : NULL;
+    const ModelJson* args = params ? params->get("arguments") : NULL;
+    if (!tool || tool->kind != ModelJson::STRING || !args || args->kind != ModelJson::OBJECT) return false;
+    std::string data, error;
+    void* context = g_embedded_api->context;
+    if (tool->value == "get_debug_context" || tool->value == "get_status") data = EmbeddedContext();
+    else if (tool->value == "debug_find_process") {
+        const ModelJson* name = args->get("name");
+        if (!name || name->kind != ModelJson::STRING || name->value.empty() || name->value.size() > 260)
+            error = "Invalid executable name";
+        else {
+            const std::wstring requested = ChatWide(name->value);
+            const size_t separator = requested.find_last_of(L"\\/");
+            const std::wstring basename = separator == std::wstring::npos ? requested : requested.substr(separator + 1);
+            HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snapshot == INVALID_HANDLE_VALUE) error = "Process snapshot unavailable";
+            else {
+                data = "{\"processes\":[";
+                PROCESSENTRY32W entry = {}; entry.dwSize = sizeof(entry);
+                uint32_t found = 0;
+                if (Process32FirstW(snapshot, &entry)) do {
+                    if (_wcsicmp(entry.szExeFile, basename.c_str()) != 0) continue;
+                    if (found++) data += ',';
+                    data += "{\"pid\":" + EmbeddedNumber(entry.th32ProcessID);
+                    EmbeddedField(&data, "name", WideToUtf8(entry.szExeFile));
+                    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+                    if (process) {
+                        wchar_t path[32768] = {}; DWORD length = _countof(path);
+                        if (QueryFullProcessImageNameW(process, 0, path, &length))
+                            EmbeddedField(&data, "path", WideToUtf8(path));
+                        CloseHandle(process);
+                    }
+                    data += '}';
+                } while (found < 32 && Process32NextW(snapshot, &entry));
+                CloseHandle(snapshot);
+                data += "],\"count\":" + EmbeddedNumber(found) + "}";
+            }
+        }
+    }
+    else if (tool->value == "thread_list") {
+        uint32_t count = 0;
+        if (!g_embedded_api->getThreadCount || !g_embedded_api->getThreadInfo ||
+            !g_embedded_api->getThreadCount(context, &count)) error = "Thread list unavailable";
+        else {
+            data = "{\"threads\":[";
+            for (uint32_t i = 0; i < count && i < 512; ++i) {
+                WdblThreadInfo info;
+                if (!g_embedded_api->getThreadInfo(context, i, &info)) continue;
+                if (data.back() != '[') data += ',';
+                data += "{\"index\":" + EmbeddedNumber(i) + ",\"thread_id\":" + EmbeddedNumber(info.threadId) +
+                    ",\"instruction_pointer\":" + EmbeddedNumber(info.instructionPointer) + "}";
+            }
+            data += "]}";
+        }
+    } else if (tool->value == "register_get" || tool->value == "stack_get_pointers") {
+        const ModelJson* index_value = args->get("index");
+        unsigned long index = index_value && index_value->kind == ModelJson::NUMBER ? strtoul(index_value->raw.c_str(), NULL, 10) : ULONG_MAX;
+        uint32_t count = 0;
+        if (index > 4096 || !g_embedded_api->getThreadCount ||
+            !g_embedded_api->getThreadCount(context, &count) || index >= count) error = "Invalid thread index";
+        else if (tool->value == "register_get") {
+            WdblRegisterInfo info;
+            if (!g_embedded_api->getRegisterInfo || !g_embedded_api->getRegisterInfo(context, index, &info)) error = "Registers unavailable";
+            else {
+                struct RegisterField { const char* name; uint64_t value; };
+                const RegisterField fields[] = {
+                    {"instruction_pointer", info.instructionPointer}, {"stack_pointer", info.stackPointer},
+                    {"frame_pointer", info.framePointer}, {"flags", info.flags},
+                    {"rax", info.rax}, {"rbx", info.rbx}, {"rcx", info.rcx}, {"rdx", info.rdx},
+                    {"rsi", info.rsi}, {"rdi", info.rdi}, {"rbp", info.rbp}, {"rsp", info.rsp},
+                    {"rip", info.rip}, {"r8", info.r8}, {"r9", info.r9}, {"r10", info.r10},
+                    {"r11", info.r11}, {"r12", info.r12}, {"r13", info.r13}, {"r14", info.r14},
+                    {"r15", info.r15}, {"dr0", info.dr0}, {"dr1", info.dr1}, {"dr2", info.dr2},
+                    {"dr3", info.dr3}, {"dr6", info.dr6}, {"dr7", info.dr7},
+                    {"eax", info.eax}, {"ebx", info.ebx}, {"ecx", info.ecx}, {"edx", info.edx},
+                    {"esi", info.esi}, {"edi", info.edi}, {"ebp", info.ebp}, {"esp", info.esp},
+                    {"eip", info.eip}, {"eflags", info.eflags}
+                };
+                data = "{\"thread_id\":" + EmbeddedNumber(info.threadId) +
+                    ",\"architecture_bits\":" + EmbeddedNumber(info.architectureBits) +
+                    ",\"is_wow64\":" + (info.isWow64 ? "true" : "false");
+                for (size_t i = 0; i < _countof(fields); ++i)
+                    data += ",\"" + std::string(fields[i].name) + "\":" + EmbeddedNumber(fields[i].value);
+                data += "}";
+            }
+        } else {
+            data = "{\"frames\":[";
+            for (uint32_t frame = 0; frame < 32; ++frame) {
+                WdblStackFrameInfo info;
+                if (!g_embedded_api->getStackFrameInfo || !g_embedded_api->getStackFrameInfo(context, index, frame, &info)) break;
+                if (data.back() != '[') data += ',';
+                data += "{\"index\":" + EmbeddedNumber(frame) +
+                    ",\"thread_id\":" + EmbeddedNumber(info.threadId) +
+                    ",\"current\":" + (info.isCurrent ? "true" : "false") +
+                    ",\"instruction_pointer\":" + EmbeddedNumber(info.instructionPointer) +
+                    ",\"stack_pointer\":" + EmbeddedNumber(info.stackPointer) +
+                    ",\"frame_pointer\":" + EmbeddedNumber(info.framePointer) +
+                    ",\"return_address\":" + EmbeddedNumber(info.returnAddress) +
+                    ",\"source_line\":" + EmbeddedNumber(info.sourceLine) +
+                    ",\"source_displacement\":" + EmbeddedNumber(info.sourceDisplacement);
+                EmbeddedField(&data, "symbol", WideToUtf8(info.symbol));
+                EmbeddedField(&data, "source_path", WideToUtf8(info.sourcePath));
+                data += "}";
+            }
+            data += "]}";
+        }
+    } else if (tool->value == "module_list") {
+        uint32_t count = 0;
+        if (!g_embedded_api->getModuleCount || !g_embedded_api->getModuleInfo ||
+            !g_embedded_api->getModuleCount(context, &count)) error = "Module list unavailable";
+        else {
+            data = "{\"modules\":[";
+            for (uint32_t i = 0; i < count && i < 512; ++i) {
+                WdblModuleInfo info;
+                if (!g_embedded_api->getModuleInfo(context, i, &info)) continue;
+                if (data.back() != '[') data += ',';
+                data += "{\"index\":" + EmbeddedNumber(i) +
+                    ",\"base\":" + EmbeddedNumber(info.baseAddress);
+                EmbeddedField(&data, "name", WideToUtf8(info.moduleName));
+                data += "}";
+            }
+            data += "]}";
+        }
+    } else if (tool->value == "breakpoint_list") {
+        uint32_t count = 0;
+        if (!g_embedded_api->getBreakpointCount || !g_embedded_api->getBreakpointInfo ||
+            !g_embedded_api->getBreakpointCount(context, &count)) error = "Breakpoint list unavailable";
+        else {
+            data = "{\"breakpoints\":[";
+            for (uint32_t i = 0; i < count && i < 512; ++i) {
+                WdblBreakpointInfo info;
+                if (!g_embedded_api->getBreakpointInfo(context, i, &info)) continue;
+                if (data.back() != '[') data += ',';
+                data += "{\"index\":" + EmbeddedNumber(i) +
+                    ",\"id\":" + EmbeddedNumber(info.id) + ",\"address\":" + EmbeddedNumber(info.address) +
+                    ",\"enabled\":" + (info.enabled ? "true" : "false") + "}";
+            }
+            data += "]}";
+        }
+    } else if (tool->value == "thread_get" || tool->value == "module_get" || tool->value == "breakpoint_get") {
+        uint64_t index = 0;
+        uint32_t count = 0;
+        if (!EmbeddedUnsigned(args->get("index"), &index) || index > UINT32_MAX)
+            error = "Invalid list index";
+        else if (tool->value == "thread_get") {
+            if (!g_embedded_api->getThreadCount || !g_embedded_api->getThreadInfo ||
+                !g_embedded_api->getThreadCount(context, &count) || index >= count) error = "Thread unavailable";
+            else {
+                WdblThreadInfo info;
+                if (!g_embedded_api->getThreadInfo(context, static_cast<uint32_t>(index), &info)) error = "Thread unavailable";
+                else {
+                    data = "{\"index\":" + EmbeddedNumber(index) +
+                        ",\"process_id\":" + EmbeddedNumber(info.processId) +
+                        ",\"thread_id\":" + EmbeddedNumber(info.threadId) +
+                        ",\"current\":" + (info.isCurrent ? "true" : "false") +
+                        ",\"has_context\":" + (info.hasContext ? "true" : "false") +
+                        ",\"teb\":" + EmbeddedNumber(info.teb) +
+                        ",\"instruction_pointer\":" + EmbeddedNumber(info.instructionPointer) +
+                        ",\"stack_pointer\":" + EmbeddedNumber(info.stackPointer) +
+                        ",\"priority\":" + std::to_string(info.priority);
+                    EmbeddedField(&data, "symbol", WideToUtf8(info.symbol));
+                    data += "}";
+                }
+            }
+        } else if (tool->value == "module_get") {
+            if (!g_embedded_api->getModuleCount || !g_embedded_api->getModuleInfo ||
+                !g_embedded_api->getModuleCount(context, &count) || index >= count) error = "Module unavailable";
+            else {
+                WdblModuleInfo info;
+                if (!g_embedded_api->getModuleInfo(context, static_cast<uint32_t>(index), &info)) error = "Module unavailable";
+                else {
+                    data = "{\"index\":" + EmbeddedNumber(index) +
+                        ",\"base\":" + EmbeddedNumber(info.baseAddress) +
+                        ",\"image_size\":" + EmbeddedNumber(info.imageSize);
+                    EmbeddedField(&data, "name", WideToUtf8(info.moduleName));
+                    EmbeddedField(&data, "path", WideToUtf8(info.imagePath));
+                    data += "}";
+                }
+            }
+        } else {
+            if (!g_embedded_api->getBreakpointCount || !g_embedded_api->getBreakpointInfo ||
+                !g_embedded_api->getBreakpointCount(context, &count) || index >= count) error = "Breakpoint unavailable";
+            else {
+                WdblBreakpointInfo info;
+                if (!g_embedded_api->getBreakpointInfo(context, static_cast<uint32_t>(index), &info)) error = "Breakpoint unavailable";
+                else {
+                    data = "{\"index\":" + EmbeddedNumber(index) +
+                        ",\"id\":" + std::to_string(info.id) +
+                        ",\"kind\":" + EmbeddedNumber(info.kind) +
+                        ",\"address\":" + EmbeddedNumber(info.address) +
+                        ",\"slot\":" + std::to_string(info.slot) +
+                        ",\"thread_id\":" + EmbeddedNumber(info.threadId) +
+                        ",\"enabled\":" + (info.enabled ? "true" : "false") +
+                        ",\"hit_count\":" + EmbeddedNumber(info.hitCount) +
+                        ",\"length\":" + EmbeddedNumber(info.length) +
+                        ",\"access\":" + EmbeddedNumber(info.access);
+                    EmbeddedField(&data, "condition", WideToUtf8(info.condition));
+                    data += "}";
+                }
+            }
+        }
+    } else if (tool->value == "resolve_expression") {
+        const ModelJson* expression = args->get("expression");
+        if (!expression || expression->kind != ModelJson::STRING || expression->value.empty()) error = "Invalid address expression";
+        else {
+            uint64_t address = 0;
+            wchar_t resolved[512] = {};
+            if (!g_embedded_api->resolveAddressExpression ||
+                !g_embedded_api->resolveAddressExpression(context, ChatWide(expression->value).c_str(),
+                    &address, resolved, _countof(resolved))) error = "Address expression could not be resolved";
+            else {
+                data = "{\"address\":" + EmbeddedNumber(address);
+                EmbeddedField(&data, "symbol", WideToUtf8(resolved));
+                data += "}";
+            }
+        }
+    } else if (tool->value == "get_symbol_path") {
+        wchar_t path[4096] = {};
+        if (!g_embedded_api->getSymbolSearchPath ||
+            !g_embedded_api->getSymbolSearchPath(context, path, _countof(path))) error = "Symbol path unavailable";
+        else {
+            data = "{";
+            data += "\"path\":";
+            ModelJson::quote(&data, WideToUtf8(path));
+            data += "}";
+        }
+    } else if (tool->value == "list_named_snapshots" || tool->value == "list_source_roots" ||
+               tool->value == "list_script_breakpoints" || tool->value == "list_exception_settings" ||
+               tool->value == "list_run_stop_expressions") {
+        const uint32_t kind = tool->value == "list_named_snapshots" ? 0 :
+            tool->value == "list_source_roots" ? 1 :
+            tool->value == "list_script_breakpoints" ? 2 :
+            tool->value == "list_exception_settings" ? 3 : 4;
+        std::vector<wchar_t> json(65536);
+        if (!g_embedded_api->getManagementListJson ||
+            !g_embedded_api->getManagementListJson(context, kind, &json[0], static_cast<uint32_t>(json.size())))
+            error = "Debugger listing unavailable or too large";
+        else data = WideToUtf8(&json[0]);
+    } else if (tool->value == "debug_open_process" || tool->value == "debug_attach_pid" ||
+               tool->value == "run" || tool->value == "step_into" || tool->value == "step_over" ||
+               tool->value == "set_software_breakpoint" || tool->value == "delete_software_breakpoint" ||
+               tool->value == "select_thread" || tool->value == "enable_breakpoint" ||
+               tool->value == "disable_breakpoint" || tool->value == "debug_detach" ||
+               tool->value == "set_breakpoint_condition" || tool->value == "clear_breakpoint_condition" ||
+               tool->value == "set_symbol_path" || tool->value == "load_symbols" ||
+               tool->value == "set_register" || tool->value == "write_memory_patch" ||
+               tool->value == "undo_memory_patch" || tool->value == "set_hardware_breakpoint" ||
+               tool->value == "set_memory_breakpoint" ||
+               tool->value == "save_stop_snapshot" || tool->value == "save_named_snapshot" ||
+               tool->value == "restore_named_snapshot" || tool->value == "step_back_snapshot" ||
+               tool->value == "add_source_root" || tool->value == "remove_source_root" ||
+               tool->value == "clear_source_roots" || tool->value == "load_script_file" ||
+               tool->value == "set_script_breakpoint" || tool->value == "remove_script_breakpoint" ||
+               tool->value == "set_exception_ignore_all" || tool->value == "add_ignored_exception" ||
+               tool->value == "remove_ignored_exception" || tool->value == "clear_ignored_exceptions" ||
+               tool->value == "add_run_stop_expression" || tool->value == "remove_run_stop_expression" ||
+               tool->value == "clear_run_stop_expressions" || tool->value == "step_until_condition" ||
+               tool->value == "run_until_condition" || tool->value == "auto_step" ||
+               tool->value == "auto_run" || tool->value == "download_symbols" ||
+               tool->value == "write_memory" || tool->value == "execute_debugger_command") {
+        std::wstring question = L"Agent requests " + ChatWide(tool->value) + L"\r\nArguments: " + ChatWide(args->raw.substr(0, 1024)) + L"\r\nExecute in the current debugger?";
+        if (InterlockedCompareExchange(&g_chat_cancel, 0, 0)) error = "Conversation cancelled";
+        else if (!EmbeddedConfirm(question, L"Confirm Agent debugger operation",
+            ChatWide(tool->value))) error = "Operation declined";
+        else if (InterlockedCompareExchange(&g_chat_cancel, 0, 0)) error = "Conversation cancelled";
+        else {
+            int32_t success = 0;
+            if (tool->value == "debug_open_process") {
+                const ModelJson* path = args->get("path"), *extra = args->get("arguments");
+                if (!path || path->kind != ModelJson::STRING || path->value.empty() ||
+                    (extra && extra->kind != ModelJson::STRING)) error = "Invalid launch arguments";
+                else {
+                    std::wstring command = L"\"" + ChatWide(path->value) + L"\"";
+                    if (extra) command += L" " + ChatWide(extra->value);
+                    if (g_embedded_api->launch) success = g_embedded_api->launch(context, command.c_str());
+                }
+            } else if (tool->value == "debug_attach_pid") {
+                const ModelJson* pid = args->get("pid");
+                unsigned long value = pid && pid->kind == ModelJson::NUMBER ? strtoul(pid->raw.c_str(), NULL, 10) : 0;
+                if (!value) error = "Invalid process ID";
+                else if (g_embedded_api->attach) success = g_embedded_api->attach(context, value);
+            } else if (tool->value == "run" && g_embedded_api->continueExecution)
+                success = g_embedded_api->continueExecution(context);
+            else if (tool->value == "step_into" && g_embedded_api->singleStep)
+                success = g_embedded_api->singleStep(context);
+            else if (tool->value == "step_over" && g_embedded_api->stepOver)
+                success = g_embedded_api->stepOver(context);
+            else if (tool->value == "set_software_breakpoint") {
+                const ModelJson* address = args->get("address");
+                unsigned __int64 value = address && address->kind == ModelJson::NUMBER ? _strtoui64(address->raw.c_str(), NULL, 10) : 0;
+                int32_t id = 0;
+                if (!value) error = "Invalid breakpoint address";
+                else if (g_embedded_api->addSoftwareBreakpoint)
+                    success = g_embedded_api->addSoftwareBreakpoint(context, value, &id);
+                if (success) data = "{\"ok\":true,\"id\":" + EmbeddedNumber(id) + "}";
+            } else if (tool->value == "delete_software_breakpoint") {
+                const ModelJson* id = args->get("id");
+                unsigned long value = id && id->kind == ModelJson::NUMBER ? strtoul(id->raw.c_str(), NULL, 10) : ULONG_MAX;
+                if (value == ULONG_MAX) error = "Invalid breakpoint ID";
+                else if (g_embedded_api->removeBreakpoint)
+                    success = g_embedded_api->removeBreakpoint(context, value);
+            } else if (tool->value == "select_thread") {
+                const ModelJson* index = args->get("index");
+                unsigned long value = index && index->kind == ModelJson::NUMBER && index->raw[0] != '-'
+                    ? strtoul(index->raw.c_str(), NULL, 10) : ULONG_MAX;
+                uint32_t count = 0;
+                if (value == ULONG_MAX || !g_embedded_api->getThreadCount ||
+                    !g_embedded_api->getThreadCount(context, &count) || value >= count)
+                    error = "Invalid thread index";
+                else if (g_embedded_api->selectThread)
+                    success = g_embedded_api->selectThread(context, value);
+            } else if (tool->value == "enable_breakpoint" || tool->value == "disable_breakpoint") {
+                const ModelJson* id = args->get("id");
+                unsigned long value = id && id->kind == ModelJson::NUMBER && id->raw[0] != '-'
+                    ? strtoul(id->raw.c_str(), NULL, 10) : ULONG_MAX;
+                if (value == ULONG_MAX || value > INT_MAX) error = "Invalid breakpoint ID";
+                else if (tool->value == "enable_breakpoint" && g_embedded_api->enableBreakpoint)
+                    success = g_embedded_api->enableBreakpoint(context, value);
+                else if (tool->value == "disable_breakpoint" && g_embedded_api->disableBreakpoint)
+                    success = g_embedded_api->disableBreakpoint(context, value);
+            } else if (tool->value == "debug_detach" && g_embedded_api->detach) {
+                success = g_embedded_api->detach(context);
+            } else if (tool->value == "set_breakpoint_condition" || tool->value == "clear_breakpoint_condition") {
+                uint64_t id = 0;
+                if (!EmbeddedUnsigned(args->get("id"), &id) || id > INT_MAX) error = "Invalid breakpoint ID";
+                else if (tool->value == "set_breakpoint_condition") {
+                    const ModelJson* expression = args->get("expression");
+                    if (!expression || expression->kind != ModelJson::STRING || expression->value.empty())
+                        error = "Invalid breakpoint condition";
+                    else if (g_embedded_api->setBreakpointCondition)
+                        success = g_embedded_api->setBreakpointCondition(context, static_cast<int32_t>(id),
+                            ChatWide(expression->value).c_str());
+                } else if (g_embedded_api->clearBreakpointCondition)
+                    success = g_embedded_api->clearBreakpointCondition(context, static_cast<int32_t>(id));
+            } else if (tool->value == "set_symbol_path") {
+                const ModelJson* path = args->get("path");
+                if (!path || path->kind != ModelJson::STRING || path->value.empty()) error = "Invalid symbol path";
+                else if (g_embedded_api->setSymbolSearchPath)
+                    success = g_embedded_api->setSymbolSearchPath(context, ChatWide(path->value).c_str());
+            } else if (tool->value == "load_symbols") {
+                const ModelJson* target = args->get("target");
+                if (target && target->kind != ModelJson::STRING) error = "Invalid symbol target";
+                else if (g_embedded_api->loadSymbols) {
+                    wchar_t pdb[4096] = {};
+                    const std::wstring requested = target ? ChatWide(target->value) : L"*";
+                    success = g_embedded_api->loadSymbols(context, requested.c_str(), pdb, _countof(pdb));
+                    if (success) {
+                        data = "{\"ok\":true";
+                        EmbeddedField(&data, "pdb_path", WideToUtf8(pdb));
+                        data += "}";
+                    }
+                }
+            } else if (tool->value == "set_register") {
+                const ModelJson* assignment = args->get("assignment");
+                if (!assignment || assignment->kind != ModelJson::STRING || assignment->value.empty() ||
+                    assignment->value.find('=') == std::string::npos) error = "Invalid register assignment";
+                else if (g_embedded_api->setRegisterValue)
+                    success = g_embedded_api->setRegisterValue(context, ChatWide(assignment->value).c_str());
+            } else if (tool->value == "write_memory_patch") {
+                uint64_t address = 0;
+                const ModelJson* hex = args->get("hex");
+                std::vector<unsigned char> bytes;
+                if (!EmbeddedUnsigned(args->get("address"), &address) || !hex ||
+                    hex->kind != ModelJson::STRING || !EmbeddedHexBytes(hex->value, &bytes))
+                    error = "Invalid memory patch";
+                else if (g_embedded_api->writeMemoryPatch) {
+                    success = g_embedded_api->writeMemoryPatch(context, address, &bytes[0],
+                        static_cast<uint32_t>(bytes.size()));
+                    if (success) data = "{\"ok\":true,\"bytes_written\":" + EmbeddedNumber(bytes.size()) + "}";
+                }
+            } else if (tool->value == "undo_memory_patch") {
+                uint64_t count = 0;
+                if (!EmbeddedUnsigned(args->get("count"), &count) || count < 1 || count > 64)
+                    error = "Invalid patch count";
+                else if (g_embedded_api->undoMemoryPatch)
+                    success = g_embedded_api->undoMemoryPatch(context, static_cast<uint32_t>(count));
+            } else if (tool->value == "set_hardware_breakpoint") {
+                uint64_t address = 0, slot = 0, length = 0, thread_id = 0;
+                const ModelJson* access = args->get("access");
+                const ModelJson* thread = args->get("thread_id");
+                const bool thread_valid = !thread || EmbeddedUnsigned(thread, &thread_id);
+                if (!EmbeddedUnsigned(args->get("address"), &address) || !address ||
+                    !EmbeddedUnsigned(args->get("slot"), &slot) || slot > 3 ||
+                    !EmbeddedUnsigned(args->get("length"), &length) ||
+                    (length != 1 && length != 2 && length != 4 && length != 8) ||
+                    !thread_valid || thread_id > UINT32_MAX || !access || access->kind != ModelJson::STRING ||
+                    (access->value != "x" && access->value != "w" && access->value != "rw") ||
+                    (access->value == "x" && length != 1)) error = "Invalid hardware breakpoint arguments";
+                else if (g_embedded_api->addHardwareBreakpoint) {
+                    const int32_t mode = access->value == "x" ? 0 : access->value == "w" ? 1 : 2;
+                    int32_t id = 0;
+                    success = g_embedded_api->addHardwareBreakpoint(context, static_cast<int32_t>(slot),
+                        address, mode, static_cast<int32_t>(length), static_cast<uint32_t>(thread_id), &id);
+                    if (success) data = "{\"ok\":true,\"id\":" + std::to_string(id) + "}";
+                }
+            } else if (tool->value == "set_memory_breakpoint") {
+                uint64_t address = 0, size = 0;
+                const ModelJson* access = args->get("access");
+                if (!EmbeddedUnsigned(args->get("address"), &address) || !address ||
+                    !EmbeddedUnsigned(args->get("size"), &size) || size < 1 || size > 1048576 ||
+                    address > static_cast<uint64_t>(-1) - size + 1 ||
+                    !access || access->kind != ModelJson::STRING || access->value.empty())
+                    error = "Invalid memory breakpoint arguments";
+                else {
+                    uint32_t mask = 0;
+                    for (size_t i = 0; i < access->value.size(); ++i) {
+                        const char bit = access->value[i];
+                        const uint32_t flag = bit == 'r' ? 1 : bit == 'w' ? 2 : bit == 'x' ? 4 : 0;
+                        if (!flag || (mask & flag)) { mask = 0; break; }
+                        mask |= flag;
+                    }
+                    if (!mask) error = "Invalid memory breakpoint access";
+                    else if (g_embedded_api->addMemoryBreakpoint) {
+                        int32_t id = 0;
+                        success = g_embedded_api->addMemoryBreakpoint(context, address, size, mask, &id);
+                        if (success) data = "{\"ok\":true,\"id\":" + std::to_string(id) + "}";
+                    }
+                }
+            }
+            else if (tool->value == "save_stop_snapshot" && g_embedded_api->saveCurrentStopSnapshot)
+                success = g_embedded_api->saveCurrentStopSnapshot(context);
+            else if (tool->value == "save_named_snapshot" || tool->value == "restore_named_snapshot") {
+                const ModelJson* name = args->get("name"), *rerun = args->get("rerun");
+                if (!name || name->kind != ModelJson::STRING || name->value.empty() ||
+                    (rerun && rerun->kind != ModelJson::BOOLEAN)) error = "Invalid snapshot arguments";
+                else if (tool->value == "save_named_snapshot" && g_embedded_api->saveNamedSnapshot)
+                    success = g_embedded_api->saveNamedSnapshot(context, ChatWide(name->value).c_str());
+                else if (tool->value == "restore_named_snapshot" && g_embedded_api->restoreNamedSnapshot)
+                    success = g_embedded_api->restoreNamedSnapshot(context, ChatWide(name->value).c_str(),
+                        rerun && rerun->value == "true" ? 1 : 0);
+            } else if (tool->value == "step_back_snapshot" && g_embedded_api->stepBackToPreviousSnapshot)
+                success = g_embedded_api->stepBackToPreviousSnapshot(context);
+            else if (tool->value == "add_source_root" || tool->value == "remove_source_root" ||
+                     tool->value == "load_script_file") {
+                const ModelJson* path = args->get("path");
+                if (!path || path->kind != ModelJson::STRING || path->value.empty()) error = "Invalid path";
+                else if (tool->value == "add_source_root" && g_embedded_api->addSourceRoot)
+                    success = g_embedded_api->addSourceRoot(context, ChatWide(path->value).c_str());
+                else if (tool->value == "remove_source_root" && g_embedded_api->removeSourceRoot)
+                    success = g_embedded_api->removeSourceRoot(context, ChatWide(path->value).c_str());
+                else if (tool->value == "load_script_file" && g_embedded_api->loadScriptFile)
+                    success = g_embedded_api->loadScriptFile(context, ChatWide(path->value).c_str());
+            } else if (tool->value == "clear_source_roots" && g_embedded_api->clearSourceRoots)
+                success = g_embedded_api->clearSourceRoots(context);
+            else if (tool->value == "set_script_breakpoint" || tool->value == "remove_script_breakpoint") {
+                uint64_t line = 0;
+                if (!EmbeddedUnsigned(args->get("line"), &line) || line < 1 || line > UINT32_MAX)
+                    error = "Invalid script line";
+                else if (tool->value == "set_script_breakpoint" && g_embedded_api->setScriptBreakpoint)
+                    success = g_embedded_api->setScriptBreakpoint(context, static_cast<uint32_t>(line));
+                else if (tool->value == "remove_script_breakpoint" && g_embedded_api->removeScriptBreakpoint)
+                    success = g_embedded_api->removeScriptBreakpoint(context, static_cast<uint32_t>(line));
+            } else if (tool->value == "set_exception_ignore_all" || tool->value == "add_ignored_exception" ||
+                       tool->value == "remove_ignored_exception" || tool->value == "clear_ignored_exceptions") {
+                uint64_t scope = 0, code = 0;
+                const ModelJson* enabled = args->get("enabled");
+                if (!EmbeddedUnsigned(args->get("scope"), &scope) || scope > 2) error = "Invalid exception scope";
+                else if (tool->value == "set_exception_ignore_all") {
+                    if (!enabled || enabled->kind != ModelJson::BOOLEAN) error = "Invalid enabled flag";
+                    else if (g_embedded_api->configureExceptionIgnoreAll)
+                        success = g_embedded_api->configureExceptionIgnoreAll(context, static_cast<int32_t>(scope),
+                            enabled->value == "true" ? 1 : 0);
+                } else if (tool->value == "clear_ignored_exceptions" && g_embedded_api->clearIgnoredExceptionCodes)
+                    success = g_embedded_api->clearIgnoredExceptionCodes(context, static_cast<int32_t>(scope));
+                else if (!EmbeddedUnsigned(args->get("code"), &code) || code > UINT32_MAX)
+                    error = "Invalid exception code";
+                else if (tool->value == "add_ignored_exception" && g_embedded_api->addIgnoredExceptionCode)
+                    success = g_embedded_api->addIgnoredExceptionCode(context, static_cast<int32_t>(scope), static_cast<uint32_t>(code));
+                else if (tool->value == "remove_ignored_exception" && g_embedded_api->removeIgnoredExceptionCode)
+                    success = g_embedded_api->removeIgnoredExceptionCode(context, static_cast<int32_t>(scope), static_cast<uint32_t>(code));
+            } else if (tool->value == "add_run_stop_expression") {
+                const ModelJson* expression = args->get("expression");
+                if (!expression || expression->kind != ModelJson::STRING || expression->value.empty())
+                    error = "Invalid run-stop expression";
+                else if (g_embedded_api->addRunStopExpression)
+                    success = g_embedded_api->addRunStopExpression(context, ChatWide(expression->value).c_str());
+            } else if (tool->value == "remove_run_stop_expression") {
+                uint64_t index = 0;
+                if (!EmbeddedUnsigned(args->get("index"), &index) || index < 1 || index > UINT32_MAX)
+                    error = "Invalid one-based expression index";
+                else if (g_embedded_api->removeRunStopExpression)
+                    success = g_embedded_api->removeRunStopExpression(context, static_cast<uint32_t>(index));
+            } else if (tool->value == "clear_run_stop_expressions" && g_embedded_api->clearRunStopExpressions)
+                success = g_embedded_api->clearRunStopExpressions(context);
+            else if (tool->value == "step_until_condition" || tool->value == "run_until_condition") {
+                const ModelJson* condition = args->get("condition");
+                uint64_t limit = 0;
+                if (!condition || condition->kind != ModelJson::STRING || condition->value.empty() ||
+                    !EmbeddedUnsigned(args->get("limit"), &limit) || limit < 1 || limit > 100000)
+                    error = "Invalid condition or limit";
+                else if (tool->value == "step_until_condition" && g_embedded_api->stepUntilCondition)
+                    success = g_embedded_api->stepUntilCondition(context, ChatWide(condition->value).c_str(), limit);
+                else if (tool->value == "run_until_condition" && g_embedded_api->runUntilCondition)
+                    success = g_embedded_api->runUntilCondition(context, ChatWide(condition->value).c_str(), limit);
+            } else if (tool->value == "auto_step" || tool->value == "auto_run") {
+                uint64_t count = 0, delay = 0;
+                if (!EmbeddedUnsigned(args->get("count"), &count) || count < 1 || count > 1000 ||
+                    !EmbeddedUnsigned(args->get("delay_ms"), &delay) || delay > 1000 ||
+                    count * delay > 60000)
+                    error = "Invalid repeat count or delay";
+                else if (tool->value == "auto_step" && g_embedded_api->autoStep)
+                    success = g_embedded_api->autoStep(context, count, static_cast<uint32_t>(delay));
+                else if (tool->value == "auto_run" && g_embedded_api->autoRun)
+                    success = g_embedded_api->autoRun(context, count, static_cast<uint32_t>(delay));
+            } else if (tool->value == "download_symbols") {
+                const ModelJson* target = args->get("target"), *cache = args->get("cache_dir"), *server = args->get("server_url");
+                if (!target || target->kind != ModelJson::STRING || target->value.empty() ||
+                    (cache && cache->kind != ModelJson::STRING) || (server && server->kind != ModelJson::STRING))
+                    error = "Invalid symbol download arguments";
+                else if (g_embedded_api->downloadSymbols) {
+                    wchar_t pdb[4096] = {};
+                    const std::wstring wtarget = ChatWide(target->value);
+                    const std::wstring wcache = cache ? ChatWide(cache->value) : L"";
+                    const std::wstring wserver = server ? ChatWide(server->value) : L"";
+                    success = g_embedded_api->downloadSymbols(context, wtarget.c_str(), wcache.c_str(),
+                        wserver.c_str(), pdb, _countof(pdb));
+                    if (success) { data = "{\"ok\":true"; EmbeddedField(&data, "pdb_path", WideToUtf8(pdb)); data += "}"; }
+                }
+            } else if (tool->value == "write_memory") {
+                uint64_t address = 0;
+                const ModelJson* hex = args->get("hex");
+                std::vector<unsigned char> bytes;
+                if (!EmbeddedUnsigned(args->get("address"), &address) || !hex ||
+                    hex->kind != ModelJson::STRING || !EmbeddedHexBytes(hex->value, &bytes))
+                    error = "Invalid memory bytes";
+                else if (g_embedded_api->writeMemory) {
+                    uint32_t written = 0;
+                    success = g_embedded_api->writeMemory(context, address, &bytes[0],
+                        static_cast<uint32_t>(bytes.size()), &written);
+                    if (success && written != bytes.size()) { success = 0; error = "Partial memory write"; }
+                    else if (success) data = "{\"ok\":true,\"bytes_written\":" + EmbeddedNumber(written) + "}";
+                }
+            } else if (tool->value == "execute_debugger_command") {
+                const ModelJson* command = args->get("command");
+                if (!command || command->kind != ModelJson::STRING || command->value.empty())
+                    error = "Invalid debugger command";
+                else if (g_embedded_api->executeCommandWithOutput) {
+                    std::vector<wchar_t> output(8192);
+                    int32_t truncated = 0;
+                    const int32_t command_ok = g_embedded_api->executeCommandWithOutput(context,
+                        ChatWide(command->value).c_str(), &output[0], static_cast<uint32_t>(output.size()), &truncated);
+                    data = std::string("{\"ok\":") + (command_ok ? "true" : "false") +
+                        ",\"truncated\":" + (truncated ? "true" : "false") + ",\"output\":";
+                    ModelJson::quote(&data, WideToUtf8(&output[0]));
+                    data += "}";
+                    success = 1;
+                }
+            }
+            if (error.empty() && !success) error = "Debugger operation failed";
+            if (success && tool->value == "run" && g_embedded_ui_update) {
+                ++g_embedded_ui_state.breakpoint_run_sequence;
+                EmbeddedPublishUi();
+            }
+            if (success && data.empty()) data = "{\"ok\":true}";
+            if (success && data.size() > 1 && data.back() == '}') {
+                data.pop_back();
+                data += ",\"debug_context\":" + EmbeddedContext() + "}";
+            }
+        }
+    } else if (tool->value == "disassemble") {
+        uint64_t address = 0, count = 0;
+        if (!EmbeddedUnsigned(args->get("address"), &address) || !address ||
+            !EmbeddedUnsigned(args->get("count"), &count) || count < 1 || count > 64)
+            error = "Invalid disassembly address or count";
+        else if (!g_embedded_api->disassembleJson) error = "Disassembly API unavailable";
+        else {
+            std::vector<wchar_t> json(32768);
+            if (!g_embedded_api->disassembleJson(context, address, static_cast<uint32_t>(count),
+                &json[0], static_cast<uint32_t>(json.size()))) error = "Disassembly failed";
+            else data = WideToUtf8(&json[0]);
+        }
+    } else if (tool->value == "find_memory") {
+        uint64_t address = 0, size = 0, limit = 64;
+        const ModelJson* hex = args->get("hex");
+        std::vector<unsigned char> pattern;
+        const ModelJson* requested_limit = args->get("max_results");
+        if (!EmbeddedUnsigned(args->get("address"), &address) ||
+            !EmbeddedUnsigned(args->get("size"), &size) || size < 1 || size > 65536 ||
+            address > UINT64_MAX - size || !hex || hex->kind != ModelJson::STRING ||
+            !EmbeddedHexBytes(hex->value, &pattern) || pattern.size() > size ||
+            (requested_limit && !EmbeddedUnsigned(requested_limit, &limit)) || limit < 1 || limit > 64)
+            error = "Invalid bounded memory search arguments";
+        else if (!g_embedded_api->readMemory) error = "Memory read API unavailable";
+        else {
+            std::vector<unsigned char> bytes(static_cast<size_t>(size));
+            uint32_t read = 0;
+            if (!g_embedded_api->readMemory(context, address, &bytes[0],
+                static_cast<uint32_t>(size), &read) || !read) error = "Memory range unreadable";
+            else {
+                data = "{\"address\":" + EmbeddedNumber(address) +
+                    ",\"bytes_read\":" + EmbeddedNumber(read) + ",\"matches\":[";
+                uint32_t matches = 0;
+                for (size_t i = 0; i + pattern.size() <= read && matches < limit; ++i) {
+                    if (!std::equal(pattern.begin(), pattern.end(), bytes.begin() + i)) continue;
+                    if (matches++) data += ',';
+                    data += EmbeddedNumber(address + i);
+                }
+                data += "],\"limit_reached\":";
+                data += matches == limit ? "true}" : "false}";
+            }
+        }
+    } else if (tool->value == "read_memory" || tool->value == "resolve_symbol") {
+        const ModelJson* address_value = args->get("address");
+        if (!address_value || address_value->kind != ModelJson::NUMBER || address_value->raw[0] == '-') error = "Invalid address";
+        else {
+            unsigned __int64 address = _strtoui64(address_value->raw.c_str(), NULL, 10);
+            if (tool->value == "resolve_symbol") {
+                wchar_t symbol[512] = {};
+                if (!g_embedded_api->resolveSymbol || !g_embedded_api->resolveSymbol(context, address, symbol, _countof(symbol)))
+                    error = "Symbol unavailable";
+                else { data = "{\"symbol\":"; ModelJson::quote(&data, WideToUtf8(symbol)); data += "}"; }
+            } else {
+                const ModelJson* size_value = args->get("size");
+                unsigned long size = size_value && size_value->kind == ModelJson::NUMBER ? strtoul(size_value->raw.c_str(), NULL, 10) : 0;
+                if (size < 1 || size > 4096) error = "Invalid read size";
+                else {
+                    unsigned char bytes[4096]; uint32_t read = 0;
+                    if (!g_embedded_api->readMemory || !g_embedded_api->readMemory(context, address, bytes, size, &read))
+                        error = "Memory read failed";
+                    else {
+                        const char hex[] = "0123456789abcdef";
+                        data = "{\"hex\":\"";
+                        for (uint32_t i = 0; i < read; ++i) { data += hex[bytes[i] >> 4]; data += hex[bytes[i] & 15]; }
+                        data += "\",\"bytes_read\":" + EmbeddedNumber(read) + "}";
+                    }
+                }
+            }
+        }
+    } else error = "Tool unavailable in embedded mode";
+    *response = "{\"jsonrpc\":\"2.0\",\"id\":" + ExtractJsonId(request);
+    if (error.empty()) *response += ",\"result\":{\"structuredContent\":" + data + "}}";
+    else { *response += ",\"error\":{\"code\":-32603,\"message\":"; ModelJson::quote(response, error); *response += "}}"; }
+    return true;
+}
+
+void EmbeddedListTaskCheckpoints(const ServerConfig& cfg) {
+    const std::wstring directory = AgentTaskFolder(cfg);
+    WIN32_FIND_DATAW found = {};
+    HANDLE search = FindFirstFileW((directory + L"\\*.json").c_str(), &found);
+    std::wstring result = L"Task checkpoints\r\n";
+    size_t count = 0;
+    if (search != INVALID_HANDLE_VALUE) {
+        do {
+            if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            const std::wstring file = found.cFileName;
+            if (file.size() < 6) continue;
+            AgentTask task;
+            if (!LoadTaskCheckpoint(directory + L"\\" + file, &task)) continue;
+            result += L"  " + ChatWide(task.id) + L"  [" + ChatWide(task.state) + L"]  " +
+                ChatWide(ContextExcerpt(task.title.empty() ? task.goal : task.title, 100)) + L"\r\n";
+            ++count;
+        } while (count < 50 && FindNextFileW(search, &found));
+        FindClose(search);
+    }
+    if (!count) result += L"  (none)\r\n";
+    result += L"Use /resume <task-id> to continue a checkpoint.\r\n";
+    g_embedded_output(g_embedded_context, result);
+}
+
+bool EmbeddedApproveRecovery(const ServerConfig& cfg, const std::string& operation_name,
+    const std::string& arguments, const std::wstring& question) {
+    ChatJob approval = {};
+    approval.cfg = cfg;
+    ModelToolBinding operation;
+    operation.mcp_name = operation_name;
+    operation.risk = MCP_DANGEROUS;
+    const bool approved = EmbeddedConfirm(question, L"Confirm Agent recovery",
+        ChatWide(operation_name));
+    return g_agent_audit(&approval, AgentOperationId(), operation, arguments,
+        approved ? "confirmed" : "deny_confirmation", "embedded_recovery") && approved;
+}
+}
+
+bool AgentEmbeddedStart(const WdblDebuggerApi* api, HWND owner, AgentEmbeddedOutput output,
+    AgentEmbeddedUiUpdate update, void* context) {
+    if (!api || !output) return false;
+    if (!g_embedded_initialized) {
+        InitializeCriticalSection(&g_config_cs);
+        InitializeCriticalSection(&g_remote_cs);
+        InitializeCriticalSection(&g_sse_cs);
+        g_sse_response_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!g_sse_response_event) return false;
+        g_embedded_initialized = true;
+    }
+    g_embedded_api = api;
+    g_embedded_output = output;
+    g_embedded_context = context;
+    g_embedded_owner = owner;
+    g_embedded_ui_owner = owner;
+    g_embedded_ui_update = update;
+    g_embedded_ui_state = AgentEmbeddedUiState();
+    InterlockedExchange(&g_embedded_cancel_requested, 0);
+    InterlockedExchange(&g_chat_cancel, 0);
+    wchar_t config_path[MAX_PATH] = {};
+    GetConfigPath(config_path, _countof(config_path));
+    if (GetFileAttributesW(config_path) == INVALID_FILE_ATTRIBUTES) {
+        g_embedded_output(g_embedded_context,
+            L"Agent configuration missing: " + std::wstring(config_path) + L"\r\n");
+        g_embedded_ui_update = NULL;
+        g_embedded_ui_owner = NULL;
+        g_embedded_api = NULL;
+        g_embedded_output = NULL;
+        return false;
+    }
+    SetDefaultConfig(&g_config);
+    LoadConfig();
+    g_embedded_activity_output = output;
+    g_embedded_activity_context = context;
+    StringCchCopyW(g_config.remote_url, _countof(g_config.remote_url), L"local://debugger-api");
+    g_agent_tools_list = EmbeddedToolsList;
+    g_agent_tool_call = EmbeddedToolCall;
+    g_embedded_history.clear();
+    g_embedded_session_has_chat = false;
+    g_embedded_task = AgentTask();
+    g_embedded_task_path.clear();
+    g_embedded_skill.clear();
+    g_embedded_skill_text.clear();
+    g_embedded_evaluation = AgentEvaluation();
+    g_embedded_evaluation_path.clear();
+    g_embedded_description.clear();
+    g_embedded_active_model = 0;
+    g_embedded_requested_model = 0;
+    std::string saved_skill;
+    LoadTerminalHistory(TerminalHistoryPath(g_config), &g_embedded_history, &saved_skill);
+    g_embedded_skill = ChatWide(saved_skill);
+    if (!g_embedded_skill.empty() && !LoadSkill(g_embedded_skill, &g_embedded_skill_text))
+        g_embedded_skill.clear();
+    wchar_t full_path[MAX_PATH] = {};
+    const DWORD path_length = GetFullPathNameW(config_path, _countof(full_path), full_path, NULL);
+    g_embedded_output(g_embedded_context, L"Agent ready.\r\nConfig: " +
+        std::wstring(path_length && path_length < _countof(full_path) ? full_path : config_path) + L"\r\n");
+    EmbeddedShowStatus(CopyConfig(), "");
+    EmbeddedPublishUi();
+    return true;
+}
+
+bool AgentEmbeddedInput(const std::wstring& line) {
+    if (!g_embedded_api || !g_embedded_output) return false;
+    if (InterlockedCompareExchange(&g_embedded_cancel_requested, 0, 0)) return true;
+    if (line == L"/help" || line == L"/h" || line == L"help") {
+        struct HelpEntry { const wchar_t* command; const wchar_t* description; };
+        const HelpEntry entries[] = {
+            {L"/font [8-24]", L"Show or set terminal font height in pixels"},
+            {L"/spacing [0-16]", L"Show or set output line spacing in pixels"},
+            {L"/status", L"Current model and task"},
+            {L"/models", L"Configured models"},
+            {L"/model <choice>", L"Select auto, primary, 1-3, or a model name"},
+            {L"/tools", L"Available debugger tools"},
+            {L"/context", L"Current target and stop state"},
+            {L"/task <goal>", L"Start or continue a managed task"},
+            {L"/task", L"Show task progress"},
+            {L"/task cancel", L"Cancel the active task"},
+            {L"/taskfile <file>", L"Run a task contract"},
+            {L"/verify", L"Recheck task with read-only tools"},
+            {L"/timeline [id]", L"Task event history"},
+            {L"/observations [id]", L"Recorded debugger observations"},
+            {L"/evidence [id]", L"Evidence receipts and freshness"},
+            {L"/skill", L"List, add, show and select skills"},
+            {L"/memory", L"Manage Agent memory"},
+            {L"/queue", L"Manage queued tasks"},
+            {L"/team", L"Collaboration settings"},
+            {L"/resolve <group> <step>", L"Resolve an analysis disagreement"},
+            {L"/eval", L"Inspect evaluations"},
+            {L"/tasks", L"List saved task checkpoints"},
+            {L"/continue", L"Continue an interrupted chat"},
+            {L"/continue retry", L"Retry a reviewed chat operation"},
+            {L"/resume <id>", L"Resume a saved task checkpoint"},
+            {L"/resume retry", L"Retry the current task step"},
+            {L"/history [count]", L"Recent chat messages (default 12, max 50)"},
+            {L"/clear", L"Clear saved chat history"},
+            {L"/config", L"Open model settings"},
+            {L"/detach", L"Open separate Agent terminal"},
+            {L"exit or /exit", L"Return to CLI"}
+        };
+        std::wstring help = L"Agent commands\r\n";
+        for (size_t i = 0; i < _countof(entries); ++i) {
+            const std::wstring command = entries[i].command;
+            const size_t split = command.find(L' ');
+            const std::wstring name = command.substr(0, split);
+            help += L"  \x1b[38;2;88;205;218m" + name + L"\x1b[39m";
+            if (split != std::wstring::npos)
+                help += L" \x1b[38;2;232;198;116m" + command.substr(split + 1) + L"\x1b[39m";
+            help += std::wstring(command.size() < 18 ? 18 - command.size() : 1, L' ');
+            help += entries[i].description;
+            help += L"\r\n";
+        }
+        help += L"\r\nEnter a request without / to chat and use the debugger tools.\r\n";
+        g_embedded_output(g_embedded_context, help);
+        return true;
+    }
+    if (line == L"/clear") {
+        g_embedded_history.clear();
+        g_embedded_session_has_chat = false;
+        g_embedded_description.clear();
+        bool saved = SaveTerminalHistory(TerminalHistoryPath(CopyConfig()), g_embedded_history,
+            WideToUtf8(g_embedded_skill.c_str()));
+        g_embedded_output(g_embedded_context, saved ? L"Agent history cleared.\r\n" :
+            L"Agent history cleared in memory, but could not save the change.\r\n");
+        return true;
+    }
+    if (line == L"/status") {
+        ServerConfig cfg = CopyConfig();
+        EmbeddedShowStatus(AgentModelConfig(cfg, g_embedded_active_model), g_embedded_description);
+        return true;
+    }
+    if (line == L"/context") {
+        g_embedded_output(g_embedded_context, ChatWide(EmbeddedContext()) + L"\r\n");
+        return true;
+    }
+    if (line == L"/models" || line == L"/model") {
+        ServerConfig cfg = CopyConfig();
+        std::wstring result = L"Models\r\n  primary  " + std::wstring(cfg.model_name) + L"\r\n";
+        for (int i = 0; i < 3; ++i) {
+            const AgentModelProfile& profile = cfg.agent.profiles[i];
+            result += L"  " + TerminalNumber(i + 1) + L"        " +
+                std::wstring(profile.name[0] ? profile.name : L"(unconfigured)") +
+                (AgentProfileReady(profile) ? L" [enabled]" : L" [disabled]") + L"\r\n";
+        }
+        result += L"Selection: " + (g_embedded_requested_model == 0 ? std::wstring(L"auto") :
+            g_embedded_requested_model == 1 ? std::wstring(L"primary") :
+            TerminalNumber(g_embedded_requested_model - 1)) + L"\r\n";
+        g_embedded_output(g_embedded_context, result);
+        return true;
+    }
+    if (line.compare(0, 7, L"/model ") == 0) {
+        ServerConfig cfg = CopyConfig();
+        int selected = SelectTerminalModel(cfg, TrimTerminalText(line.substr(7)));
+        if (selected < 0) {
+            g_embedded_output(g_embedded_context, L"Choose auto, primary, an enabled slot (1-3), or a unique model name.\r\n");
+            return true;
+        }
+        g_embedded_requested_model = selected;
+        g_embedded_active_model = selected > 0 ? selected - 1 : 0;
+        EmbeddedShowStatus(AgentModelConfig(cfg, g_embedded_active_model), g_embedded_description);
+        return true;
+    }
+    if (line == L"/tools") {
+        std::string payload;
+        ModelJson root;
+        if (!EmbeddedToolsList(CopyConfig(), &payload, false) || !ModelJson::parse(payload, &root)) return false;
+        const ModelJson* tools = root.get("tools");
+        if (!tools || tools->kind != ModelJson::ARRAY) return false;
+        std::wstring result = L"Available debugger tools\r\n";
+        for (size_t i = 0; i < tools->items.size(); ++i) {
+            const ModelJson* name = tools->items[i].get("name");
+            const ModelJson* description = tools->items[i].get("description");
+            if (name && name->kind == ModelJson::STRING) {
+                result += L"  " + ChatWide(name->value);
+                if (description && description->kind == ModelJson::STRING)
+                    result += L"  -  " + ChatWide(description->value);
+                result += L"\r\n";
+            }
+        }
+        g_embedded_output(g_embedded_context, result);
+        return true;
+    }
+    if (line == L"/history" || line.compare(0, 9, L"/history ") == 0) {
+        size_t limit = 12;
+        if (line != L"/history") {
+            std::wistringstream input(line.substr(9));
+            unsigned value = 0;
+            std::wstring extra;
+            if (!(input >> value) || (input >> extra) || value < 1 || value > 50) {
+                g_embedded_output(g_embedded_context, L"Usage: /history [1-50]\r\n");
+                return true;
+            }
+            limit = value;
+        }
+        std::vector<std::wstring> rows;
+        for (size_t i = g_embedded_history.size(); i > 0 && rows.size() < limit; --i) {
+            ModelJson message;
+            if (!ModelJson::parse(g_embedded_history[i - 1], &message)) continue;
+            const ModelJson* role = message.get("role");
+            if (!role || (role->value != "user" &&
+                (role->value != "assistant" || message.get("tool_calls")))) continue;
+            std::string content;
+            if (!ModelMessageText(message, &content)) continue;
+            std::wstring visible = ChatWide(content);
+            for (size_t j = 0; j < visible.size(); ++j)
+                if (visible[j] == L'\r' || visible[j] == L'\n') visible[j] = L' ';
+            if (visible.size() > 240) visible = visible.substr(0, 237) + L"...";
+            rows.push_back(ChatWide(role->value) + L": " + visible + L"\r\n");
+        }
+        std::wstring result = rows.empty() ? L"No saved conversation.\r\n" : L"Recent conversation\r\n";
+        for (size_t i = rows.size(); i > 0; --i) result += L"  " + rows[i - 1];
+        g_embedded_output(g_embedded_context, result);
+        return true;
+    }
+    ServerConfig cfg = CopyConfig();
+    if (line == L"/team") {
+        EmbeddedConsoleOutput([&](HANDLE output) {
+            ShowAgentModels(output, cfg);
+            ConsoleWrite(output, L"  Collaboration: " + std::wstring(cfg.collaboration ? L"on" : L"off") +
+                L"; coordinator slot: " + TerminalNumber(cfg.coordinator) +
+                L"; parallel analysis workers: " + TerminalNumber(cfg.parallel_workers) + L"\r\n");
+            return true;
+        });
+        return true;
+    }
+    if (line == L"/skill" || line.compare(0, 7, L"/skill ") == 0) {
+        if (line.compare(0, 11, L"/skill add ") == 0) {
+            const std::wstring value = TrimTerminalText(line.substr(11));
+            const size_t split = value.find(L' ');
+            const std::wstring name = value.substr(0, split);
+            const std::wstring instructions = split == std::wstring::npos ? L"" :
+                TrimTerminalText(value.substr(split + 1));
+            if (!ValidSkillName(name) || instructions.empty() ||
+                WideToUtf8(instructions.c_str()).size() > 12 * 1024) {
+                g_embedded_output(g_embedded_context, L"Usage: /skill add NAME <instructions> (up to 12 KB).\r\n");
+                return true;
+            }
+            std::string existing;
+            if (LoadSkill(name, &existing)) {
+                g_embedded_output(g_embedded_context, L"A skill with that name already exists.\r\n");
+                return true;
+            }
+            const std::string content = "# " + WideToUtf8(name.c_str()) + "\n\n" +
+                WideToUtf8(instructions.c_str()) + "\n";
+            if (!SaveSkill(name, content)) {
+                g_embedded_output(g_embedded_context, L"Could not save skill.\r\n");
+                return true;
+            }
+            g_embedded_skill = name; g_embedded_skill_text = content;
+            SaveTerminalHistory(TerminalHistoryPath(cfg), g_embedded_history,
+                WideToUtf8(name.c_str()));
+            g_embedded_output(g_embedded_context, L"Skill saved and active: " + name + L"\r\n");
+            return true;
+        }
+        std::wstring draft_name; std::string draft_text;
+        if (EmbeddedConsoleOutput([&](HANDLE output) {
+            return HandleSkillCommand(line, NULL, output, &g_embedded_skill,
+                &g_embedded_skill_text, &draft_name, &draft_text,
+                TerminalHistoryPath(cfg), g_embedded_history);
+        })) return true;
+    }
+    if (EmbeddedConsoleOutput([&](HANDLE output) {
+        return HandleMemoryCommand(line, output, cfg) ||
+            HandleQueueCommand(line, output, cfg, g_embedded_requested_model,
+                g_embedded_skill_text) ||
+            HandleEvaluationCommand(line, output, cfg, &g_embedded_evaluation,
+                g_embedded_evaluation_path) ||
+            HandleEvidenceCommand(line, output, cfg, &g_embedded_task,
+                g_embedded_task_path);
+    })) return true;
+    if (line == L"/task cancel") {
+        if (g_embedded_task.id.empty() || g_embedded_task.state == "cancelled") {
+            g_embedded_output(g_embedded_context, L"No active task to cancel.\r\n");
+            return true;
+        }
+        ChatJob record = {}; record.cfg = cfg; record.task = g_embedded_task;
+        record.task_record_path = g_embedded_task_path;
+        TaskCheckpointLease lease;
+        if (!lease.acquire(&record)) {
+            g_embedded_output(g_embedded_context, L"Task checkpoint is in use or changed; reload it with /resume.\r\n");
+            return true;
+        }
+        record.task.state = "cancelled";
+        if (!SaveAgentTaskRecord(&record)) {
+            g_embedded_output(g_embedded_context, L"Could not save cancellation checkpoint.\r\n");
+            return true;
+        }
+        g_embedded_task = record.task;
+        g_embedded_task_path = record.task_record_path;
+        g_embedded_output(g_embedded_context, L"Task cancelled.\r\n");
+        return true;
+    }
+    if (line == L"/timeline" || line.compare(0, 10, L"/timeline ") == 0 ||
+        line == L"/observations" || line.compare(0, 14, L"/observations ") == 0) {
+        const bool observations = line.compare(0, 13, L"/observations") == 0;
+        const std::wstring id = TrimTerminalText(line.substr(observations ? 13 : 9));
+        AgentTask shown = g_embedded_task;
+        if (!id.empty()) {
+            if (!ValidTaskRecordId(id) ||
+                !LoadTaskCheckpoint(AgentTaskFolder(cfg) + L"\\" + id + L".json", &shown) ||
+                shown.server_binding != AgentServerBinding(cfg)) {
+                g_embedded_output(g_embedded_context, L"Task timeline unavailable.\r\n");
+                return true;
+            }
+        }
+        std::wstring result;
+        for (size_t i = 0; i < shown.timeline.size(); ++i) {
+            if (!observations) { result += ChatWide(shown.timeline[i]) + L"\r\n"; continue; }
+            ModelJson event;
+            if (!ModelJson::parse(shown.timeline[i], &event) || !event.get("kind") ||
+                event.get("kind")->value != "observation" || !event.get("detail")) continue;
+            result += L"  " + ChatWide((event.get("time") ? event.get("time")->value : "") +
+                "  " + event.get("detail")->value) + L"\r\n";
+        }
+        g_embedded_output(g_embedded_context, result.empty() ?
+            L"No task records available.\r\n" : result);
+        return true;
+    }
+    if (line.compare(0, 9, L"/resolve ") == 0) {
+        const std::wstring value = TrimTerminalText(line.substr(9));
+        const size_t split = value.find(L' ');
+        const std::string group = WideToUtf8(value.substr(0, split).c_str());
+        const std::wstring choice = split == std::wstring::npos ? L"" : TrimTerminalText(value.substr(split + 1));
+        const int selected = choice.size() == 1 && choice[0] >= L'1' && choice[0] <= L'8' ? choice[0] - L'1' : -1;
+        ChatJob resolved = {}; resolved.cfg = cfg; resolved.task = g_embedded_task;
+        resolved.task_enabled = true; resolved.task_record_path = g_embedded_task_path;
+        TaskCheckpointLease lease;
+        ModelToolBinding operation; operation.mcp_name = "resolve_analysis"; operation.risk = MCP_MODIFY;
+        std::string detail = "{\"group\":"; ModelJson::quote(&detail, group);
+        detail += ",\"selected\":" + TaskNumber(selected + 1) + '}';
+        if (g_embedded_task.id.empty() || !ResolveAnalysisAgreement(&resolved.task, group, selected) ||
+            !lease.acquire(&resolved) ||
+            !g_agent_audit(&resolved, AgentOperationId(), operation, detail, "user_resolution", "confirmed")) {
+            g_embedded_output(g_embedded_context, L"Resolution unavailable or checkpoint/audit failed.\r\n");
+            return true;
+        }
+        RecordTaskTimeline(&resolved.task, AgentUtc(), "user_resolution", selected,
+            resolved.active_model, detail);
+        if (!SaveAgentTaskRecord(&resolved)) {
+            g_embedded_output(g_embedded_context, L"Could not save resolution.\r\n");
+            return true;
+        }
+        g_embedded_task = resolved.task; g_embedded_task_path = resolved.task_record_path;
+        g_embedded_output(g_embedded_context, L"Resolution saved. Send a message to continue.\r\n");
+        return true;
+    }
+    if (line == L"/task") {
+        if (g_embedded_task.id.empty()) {
+            g_embedded_output(g_embedded_context, L"No active task. Use /task <goal>.\r\n");
+        } else {
+            std::wstring result = L"Task ID: " + ChatWide(g_embedded_task.id) + L"\r\nTask: " + ChatWide(g_embedded_task.title.empty() ?
+                g_embedded_task.goal : g_embedded_task.title) + L"\r\nState: " +
+                ChatWide(g_embedded_task.state) + L"\r\n";
+            for (size_t i = 0; i < g_embedded_task.steps.size(); ++i)
+                result += L"  " + TerminalNumber((int)i + 1) + L". [" +
+                    ChatWide(g_embedded_task.steps[i].status) + L"] " +
+                    ChatWide(g_embedded_task.steps[i].title) + L"\r\n";
+            g_embedded_output(g_embedded_context, result);
+        }
+        return true;
+    }
+    if (line == L"/tasks" || line == L"/resume") {
+        EmbeddedListTaskCheckpoints(cfg);
+        return true;
+    }
+    std::wstring request = line;
+    std::wstring restored_path;
+    AgentTask restored_task;
+    ChatContinuation continuation;
+    const bool resume_task = line.compare(0, 8, L"/resume ") == 0;
+    const bool retry_task = line == L"/resume retry";
+    const bool continue_chat = line == L"/continue" || line == L"/continue retry";
+    const bool retry_chat = line == L"/continue retry";
+    const bool taskfile = line.compare(0, 10, L"/taskfile ") == 0;
+    const bool verify_task = line == L"/verify";
+    bool verify_chat = false;
+    AgentTask contract;
+    if (taskfile) {
+        std::wstring path = TrimTerminalText(line.substr(10));
+        if (path.size() > 1 && path.front() == L'"' && path.back() == L'"')
+            path = path.substr(1, path.size() - 2);
+        std::string contents;
+        if (!AgentReadJson(path, 128 * 1024, &contents) || !ParseTaskContract(contents, &contract)) {
+            g_embedded_output(g_embedded_context,
+                L"Invalid task contract: expected a goal, 1-8 steps and read-only checks.\r\n");
+            return true;
+        }
+        request = ChatWide(contract.goal);
+    } else if (verify_task) {
+        if (g_embedded_task.steps.empty()) {
+            g_embedded_output(g_embedded_context, L"Start a task first.\r\n");
+            return true;
+        }
+        request = L"Re-verify the current task goal using read-only observations; do not repeat state-changing actions.";
+    }
+    if (resume_task) {
+        const std::wstring id = retry_task ? ChatWide(g_embedded_task.id) : TrimTerminalText(line.substr(8));
+        if (!ValidTaskRecordId(id)) {
+            g_embedded_output(g_embedded_context, L"Invalid task ID. Use /tasks to find a checkpoint.\r\n");
+            return true;
+        }
+        restored_path = AgentTaskFolder(cfg) + L"\\" + id + L".json";
+        if (!LoadTaskCheckpoint(restored_path, &restored_task) || ChatWide(restored_task.id) != id ||
+            (retry_task && restored_task.id != g_embedded_task.id) ||
+            restored_task.server_binding != AgentServerBinding(cfg)) {
+            g_embedded_output(g_embedded_context, L"Checkpoint unavailable or bound to another Agent connection.\r\n");
+            return true;
+        }
+        if (TaskCurrentStep(restored_task) < 0) {
+            g_embedded_output(g_embedded_context, L"This task has no unfinished step.\r\n");
+            return true;
+        }
+        std::string arguments = "{\"task_id\":";
+        ModelJson::quote(&arguments, restored_task.id);
+        arguments += "}";
+        const std::wstring warning = retry_task ?
+            L"The current step may repeat a debugger change. Inspect the target before retrying.\r\nTask: " :
+            L"Resume this checkpoint with fresh read-only verification of the current target?\r\nTask: ";
+        if (!EmbeddedApproveRecovery(cfg, retry_task ? "resume_retry" : "resume_task", arguments,
+            warning + id)) {
+            g_embedded_output(g_embedded_context, L"Task recovery declined or could not be audited.\r\n");
+            return true;
+        }
+        if (retry_task) {
+            if (!PrepareAuthorizedTaskRetry(&restored_task)) {
+                g_embedded_output(g_embedded_context, L"The current step cannot be retried.\r\n");
+                return true;
+            }
+        } else if ((restored_task.state == "blocked" || restored_task.state == "failed") &&
+                   !PrepareInvalidVerifierContinuation(&restored_task, cfg.task_error_mode == 1)) {
+            g_embedded_task = restored_task;
+            g_embedded_task_path = restored_path;
+            g_embedded_output(g_embedded_context, L"This checkpoint needs external input or /resume retry.\r\n");
+            return true;
+        }
+        request = retry_task ? L"Retry the current task step with the user's explicit authorization." :
+            L"Resume the checkpoint: verify the interrupted step using fresh read-only observations, then continue unfinished steps.";
+    } else if (continue_chat) {
+        if ((!g_embedded_task.id.empty() && g_embedded_task.state != "completed" &&
+             g_embedded_task.state != "cancelled") || cfg.task_mode || cfg.collaboration) {
+            g_embedded_output(g_embedded_context, L"Managed tasks resume with /resume <task-id>.\r\n");
+            return true;
+        }
+        if (!LoadChatContinuation(TerminalHistoryPath(cfg), &continuation) || g_embedded_history.empty()) {
+            g_embedded_output(g_embedded_context, L"No interrupted chat checkpoint or saved history is available.\r\n");
+            return true;
+        }
+        if (!ChatContinuationTargetMatches(cfg, continuation.target)) {
+            g_embedded_output(g_embedded_context, L"Debugger target or session changed. Chat recovery stopped.\r\n");
+            return true;
+        }
+        const bool pending = !continuation.tool.empty();
+        if (retry_chat && (!pending || continuation.reason != "verified_review")) {
+            g_embedded_output(g_embedded_context, L"Run /continue for read-only verification before retrying.\r\n");
+            return true;
+        }
+        if (!retry_chat && continuation.reason == "verified_review") {
+            g_embedded_output(g_embedded_context, L"Review /history, then use /continue retry if the operation is still needed.\r\n");
+            return true;
+        }
+        if (retry_chat) {
+            std::string arguments = "{\"tool\":";
+            ModelJson::quote(&arguments, continuation.tool);
+            arguments += "}";
+            if (!EmbeddedApproveRecovery(cfg, "continue_chat_retry", arguments,
+                L"The previous debugger operation may already have executed. Retry after reviewing the target?")) {
+                g_embedded_output(g_embedded_context, L"Chat retry declined or could not be audited.\r\n");
+                return true;
+            }
+        }
+        verify_chat = pending && !retry_chat;
+        request = ChatWide(verify_chat ?
+            "Read-only recovery: inspect fresh debugger state and determine whether the pending operation already happened. "
+            "Do not repeat any state-changing tool. Original request: " + continuation.goal +
+            "\nPending tool: " + continuation.tool + " " + continuation.arguments :
+            "Continue the original request from saved tool results. Refresh debugger state before acting. "
+            "Do not blindly repeat earlier tool calls. Original request: " + continuation.goal);
+    } else if (line.empty() || (line[0] == L'/' && line.compare(0, 6, L"/task ") != 0 &&
+               !taskfile && !verify_task)) {
+        g_embedded_output(g_embedded_context, L"Unknown Agent command. Use /help.\r\n");
+        return true;
+    }
+    ChatJob job = {};
+    job.cfg = cfg;
+    job.cfg.stream_output = true;
+    job.prompt = WideToUtf8(line.compare(0, 6, L"/task ") == 0 ? line.substr(6).c_str() : request.c_str());
+    job.task_enabled = resume_task || taskfile || verify_task ||
+        line.compare(0, 6, L"/task ") == 0 || job.cfg.task_mode;
+    job.verification_only = verify_task || verify_chat;
+    job.skill_name = WideToUtf8(g_embedded_skill.c_str());
+    job.skill_instructions = g_embedded_skill_text;
+    job.chat_skill = job.skill_name;
+    job.requested_model = g_embedded_requested_model;
+    if (resume_task) {
+        job.task = restored_task;
+        job.task_record_path = restored_path;
+    } else if (taskfile) {
+        job.task = contract;
+    } else if (verify_task) {
+        job.task = g_embedded_task;
+        job.task_record_path = g_embedded_task_path;
+        job.task.evidence.clear(); job.task.state = "running"; job.task.last_feedback.clear();
+        for (size_t i = 0; i < job.task.steps.size(); ++i) {
+            job.task.steps[i].status = "verifying"; job.task.steps[i].last_mutation = -1;
+            job.task.steps[i].retries = 0; job.task.steps[i].reason.clear();
+            job.task.steps[i].evidence_ids.clear(); job.task.steps[i].output.clear();
+        }
+    } else if (line.compare(0, 6, L"/task ") == 0) {
+        job.task = AgentTask();
+        job.task.goal = job.prompt;
+    } else if (job.task_enabled && !g_embedded_task.id.empty() &&
+               g_embedded_task.state != "completed" && g_embedded_task.state != "cancelled")
+        { job.task = g_embedded_task; job.task_record_path = g_embedded_task_path; }
+    const bool new_conversation = taskfile || line.compare(0, 6, L"/task ") == 0 ||
+        (!g_embedded_session_has_chat && !resume_task && !continue_chat && !verify_task);
+    job.history = resume_task ? restored_task.checkpoint_history :
+        new_conversation ? std::vector<std::string>() : g_embedded_history;
+    job.chat_history_path = TerminalHistoryPath(job.cfg);
+    job.chat_goal = continue_chat ? continuation.goal : job.prompt;
+    job.chat_recovery_verify = verify_chat;
+    job.chat_resume_authorized = retry_chat;
+    if (continue_chat) {
+        job.chat_recovery_target = continuation.target;
+        job.chat_pending_tool = continuation.tool;
+        job.chat_pending_arguments = continuation.arguments;
+        job.chat_pending_target = continuation.target;
+    }
+    job.streamed_round = -1;
+    job.final_round = -1;
+    if (InterlockedCompareExchange(&g_embedded_cancel_requested, 0, 0)) return true;
+    g_embedded_progress_state.clear();
+    g_embedded_ui_state.working = true;
+    g_embedded_run_started = GetTickCount64();
+    g_embedded_ui_state.elapsed_ms = 0;
+    g_embedded_ui_state.approval = false;
+    g_embedded_ui_state.phase = L"Preparing";
+    g_embedded_ui_state.detail.clear();
+    g_embedded_ui_state.hits = g_embedded_ui_state.hit_target = 0;
+    g_embedded_ui_state.breakpoint_run_sequence = 0;
+    if (!job.task.goal.empty()) g_embedded_description = job.task.goal;
+    else if (g_embedded_description.empty()) g_embedded_description = job.prompt;
+    g_embedded_ui_state.task = ChatWide(job.task.title.empty() ? job.task.goal : job.task.title);
+    if (g_embedded_ui_state.task.empty()) g_embedded_ui_state.task = ChatWide(job.prompt);
+    g_embedded_ui_state.task_state = ChatWide(job.task.state);
+    g_embedded_ui_state.step = 0;
+    g_embedded_ui_state.steps = 0;
+    g_embedded_ui_state.current_step.clear();
+    UpdateAgentTaskPanel(job.task);
+    EmbeddedPublishUi();
+    EmbeddedShowStatus(AgentModelConfig(job.cfg, g_embedded_active_model), g_embedded_description);
+    InterlockedExchange(&g_chat_cancel, 0);
+    bool ok = RunChat(&job);
+    if (ok || job.history_consistent) g_embedded_session_has_chat = true;
+    g_embedded_ui_state.working = false;
+    g_embedded_ui_state.elapsed_ms = GetTickCount64() - g_embedded_run_started;
+    g_embedded_ui_state.approval = false;
+    g_embedded_ui_state.phase = ok ? L"Finished" : job.chat_paused ? L"Paused" : L"Failed";
+    g_embedded_ui_state.task = ChatWide(job.task.title.empty() ? job.task.goal : job.task.title);
+    g_embedded_ui_state.task_state = ChatWide(job.task.state);
+    UpdateAgentTaskPanel(job.task);
+    EmbeddedPublishUi();
+    if (ok || job.history_consistent) {
+        g_embedded_history.swap(job.history);
+        SaveTerminalHistory(job.chat_history_path, g_embedded_history,
+            WideToUtf8(g_embedded_skill.c_str()));
+    }
+    if (job.task_enabled) {
+        g_embedded_task = job.task;
+        g_embedded_task_path = job.task_record_path;
+    }
+    g_embedded_evaluation = job.evaluation;
+    g_embedded_evaluation_path = job.evaluation_path;
+    if (job.active_model >= 0 && job.active_model <= 3) {
+        int previous_model = g_embedded_active_model;
+        g_embedded_active_model = job.active_model;
+        ServerConfig active = AgentModelConfig(job.cfg, job.active_model);
+        g_embedded_ui_state.model = active.model_name;
+        EmbeddedPublishUi();
+        if (previous_model != g_embedded_active_model)
+            EmbeddedShowStatus(active, g_embedded_description);
+    }
+    const bool streamed_answer = ok && job.streamed_round == job.final_round &&
+        !job.streamed_text.empty() &&
+        job.answer.compare(0, job.streamed_text.size(), job.streamed_text) == 0;
+    const std::string remaining = streamed_answer ? job.answer.substr(job.streamed_text.size()) : job.answer;
+    if (!streamed_answer || !remaining.empty()) g_embedded_output(g_embedded_context,
+        std::wstring(L"\r\n  ") + (ok ? L"\x1b[38;2;126;206;149mRESPONSE\x1b[0m" :
+            job.chat_paused ? L"\x1b[38;2;232;198;116mPAUSED\x1b[0m" :
+            L"\x1b[38;2;224;120;112mERROR\x1b[0m") +
+        L"\r\n" + EmbeddedFormatAnswer(ChatWide(remaining)) + L"\r\n");
+    else g_embedded_output(g_embedded_context, L"\r\n");
+    if (job.task_enabled && (job.task.state == "paused" || job.task.state == "blocked" ||
+                             job.task.state == "failed") && !job.task.id.empty()) {
+        if (!job.task_record_path.empty() &&
+            GetFileAttributesW(job.task_record_path.c_str()) != INVALID_FILE_ATTRIBUTES)
+            g_embedded_output(g_embedded_context, L"Task checkpoint: " + ChatWide(job.task.id) +
+                L"\r\nUse /resume " + ChatWide(job.task.id) + L" after inspecting the current target.\r\n");
+        else g_embedded_output(g_embedded_context, L"Task paused, but its checkpoint was not saved.\r\n");
+    } else if (job.chat_paused)
+        g_embedded_output(g_embedded_context, L"Chat paused. Use /continue to resume.\r\n");
+    if (verify_chat && ok)
+        g_embedded_output(g_embedded_context,
+            L"Review /history, then use /continue retry to authorize a needed operation.\r\n");
+    return true;
+}
+
+void AgentEmbeddedCancel() {
+    InterlockedExchange(&g_embedded_cancel_requested, 1);
+    InterlockedExchange(&g_chat_cancel, 1);
+}
+
+void AgentEmbeddedStop() {
+    AgentEmbeddedCancel();
+    g_embedded_ui_update = NULL;
+    g_embedded_ui_owner = NULL;
+    g_embedded_ui_state = AgentEmbeddedUiState();
+    g_embedded_activity_output = NULL;
+    g_embedded_activity_context = NULL;
+    g_embedded_api = NULL;
+    g_embedded_output = NULL;
+    g_embedded_context = NULL;
+    g_embedded_owner = NULL;
+}
+#endif

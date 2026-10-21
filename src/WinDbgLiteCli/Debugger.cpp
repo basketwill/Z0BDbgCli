@@ -2552,6 +2552,9 @@ Debugger::Debugger(const std::wstring& tracePath)
     debuggerApi_.getBreakpointCount = &Debugger::DebuggerApiGetBreakpointCountThunk;
     debuggerApi_.getBreakpointInfo = &Debugger::DebuggerApiGetBreakpointInfoThunk;
     debuggerApi_.executeCommand = &Debugger::DebuggerApiExecuteCommandThunk;
+    debuggerApi_.getManagementListJson = &Debugger::DebuggerApiGetManagementListJsonThunk;
+    debuggerApi_.executeCommandWithOutput = &Debugger::DebuggerApiExecuteCommandWithOutputThunk;
+    debuggerApi_.disassembleJson = &Debugger::DebuggerApiDisassembleJsonThunk;
     symbolCacheDirectory_ = QueryDefaultSymbolCacheDirectory();
     symbolServerUrl_ = L"https://msdl.microsoft.com/download/symbols";
     EnsureConsoleColorEnabled();
@@ -14442,6 +14445,23 @@ int32_t WDBL_CALL Debugger::DebuggerApiExecuteCommandThunk(void* context, const 
     return debugger != nullptr ? debugger->DebuggerApiExecuteCommand(command) : 0;
 }
 
+int32_t WDBL_CALL Debugger::DebuggerApiGetManagementListJsonThunk(void* context, uint32_t kind, wchar_t* outJson, uint32_t outJsonChars) {
+    auto* debugger = static_cast<Debugger*>(context);
+    return debugger != nullptr ? debugger->DebuggerApiGetManagementListJson(kind, outJson, outJsonChars) : 0;
+}
+
+int32_t WDBL_CALL Debugger::DebuggerApiExecuteCommandWithOutputThunk(void* context, const wchar_t* command,
+    wchar_t* outText, uint32_t outTextChars, int32_t* outTruncated) {
+    auto* debugger = static_cast<Debugger*>(context);
+    return debugger != nullptr ? debugger->DebuggerApiExecuteCommandWithOutput(command, outText, outTextChars, outTruncated) : 0;
+}
+
+int32_t WDBL_CALL Debugger::DebuggerApiDisassembleJsonThunk(void* context, uint64_t address,
+    uint32_t count, wchar_t* outJson, uint32_t outJsonChars) {
+    auto* debugger = static_cast<Debugger*>(context);
+    return debugger ? debugger->DebuggerApiDisassembleJson(address, count, outJson, outJsonChars) : 0;
+}
+
 void Debugger::PluginHostLog(const wchar_t* text) {
     if (text == nullptr || text[0] == L'\0') {
         return;
@@ -14476,6 +14496,7 @@ int32_t Debugger::PluginHostGetStopInfo(WdblStopInfo* outInfo) const {
     }
     WdblStopInfo info = WdblStopInfo();
     info.size = sizeof(WdblStopInfo);
+    EnterCriticalSection(const_cast<CRITICAL_SECTION*>(&stateLock_));
     if (pendingEvent_.valid && stopState_.valid) {
         info.paused = 1;
         info.processId = stopState_.processId;
@@ -14486,6 +14507,7 @@ int32_t Debugger::PluginHostGetStopInfo(WdblStopInfo* outInfo) const {
         info.instructionPointer = GetInstructionPointer(stopState_.context);
         CopyWideText(info.reason, stopState_.reason);
     }
+    LeaveCriticalSection(const_cast<CRITICAL_SECTION*>(&stateLock_));
     *outInfo = info;
     return 1;
 }
@@ -14773,6 +14795,7 @@ int32_t Debugger::DebuggerApiUndoMemoryPatch(uint32_t count) const {
 }
 
 int32_t Debugger::DebuggerApiSaveCurrentStopSnapshot() const {
+    if (!pendingEvent_.valid || !stopState_.valid) return 0;
     const_cast<Debugger*>(this)->SaveCurrentStopSnapshot();
     return 1;
 }
@@ -15084,6 +15107,167 @@ int32_t Debugger::DebuggerApiExecuteCommand(const wchar_t* command) {
         return 0;
     }
     return ExecuteCommand(tokens, false) ? 1 : 0;
+}
+
+int32_t Debugger::DebuggerApiExecuteCommandWithOutput(const wchar_t* command, wchar_t* outText,
+    uint32_t outTextChars, int32_t* outTruncated) {
+    if (!outText || outTextChars == 0 || !outTruncated) return 0;
+    outText[0] = L'\0';
+    *outTruncated = 0;
+    static SRWLOCK captureLock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&captureLock);
+    struct ReleaseCaptureLock {
+        SRWLOCK* lock;
+        ~ReleaseCaptureLock() { ReleaseSRWLockExclusive(lock); }
+    } releaseLock = {&captureLock};
+    class CaptureBuffer : public std::wstreambuf {
+    public:
+        CaptureBuffer(std::wstreambuf* destination, size_t capacity)
+            : destination_(destination), capacity_(capacity), thread_(GetCurrentThreadId()), truncated_(false) {}
+        const std::wstring& output() const { return output_; }
+        bool truncated() const { return truncated_; }
+    protected:
+        std::streamsize xsputn(const wchar_t* text, std::streamsize count) override {
+            if (GetCurrentThreadId() == thread_ && count > 0) {
+                const size_t available = capacity_ - output_.size();
+                const size_t copied = (std::min)(available, static_cast<size_t>(count));
+                output_.append(text, copied);
+                if (copied < static_cast<size_t>(count)) truncated_ = true;
+            }
+            return destination_->sputn(text, count);
+        }
+        int_type overflow(int_type value) override {
+            if (traits_type::eq_int_type(value, traits_type::eof())) return traits_type::not_eof(value);
+            const wchar_t ch = traits_type::to_char_type(value);
+            if (GetCurrentThreadId() == thread_) {
+                if (output_.size() < capacity_) output_ += ch;
+                else truncated_ = true;
+            }
+            return destination_->sputc(ch);
+        }
+        int sync() override { return destination_->pubsync(); }
+    private:
+        std::wstreambuf* destination_;
+        size_t capacity_;
+        DWORD thread_;
+        std::wstring output_;
+        bool truncated_;
+    };
+    std::wcout.flush();
+    CaptureBuffer capture(std::wcout.rdbuf(), outTextChars - 1);
+    struct RestoreBuffer {
+        std::wstreambuf* original;
+        ~RestoreBuffer() { std::wcout.rdbuf(original); }
+    } restore = {std::wcout.rdbuf(&capture)};
+    const int32_t success = DebuggerApiExecuteCommand(command);
+    std::wcout.flush();
+    wcsncpy_s(outText, outTextChars, capture.output().c_str(), _TRUNCATE);
+    *outTruncated = capture.truncated() ? 1 : 0;
+    return success;
+}
+
+int32_t Debugger::DebuggerApiDisassembleJson(uint64_t address, uint32_t count,
+    wchar_t* outJson, uint32_t outJsonChars) const {
+    if (!outJson || !outJsonChars || !processHandle_ || !address || count < 1 || count > 64) return 0;
+    outJson[0] = L'\0';
+    MEMORY_BASIC_INFORMATION region = {};
+    if (!VirtualQueryEx(processHandle_, reinterpret_cast<LPCVOID>(address), &region, sizeof(region)) ||
+        region.State != MEM_COMMIT || !IsReadableProtection(region.Protect)) return 0;
+    const uint64_t end = reinterpret_cast<uint64_t>(region.BaseAddress) + region.RegionSize;
+    if (end <= address) return 0;
+    const size_t length = static_cast<size_t>((std::min)(end - address,
+        static_cast<uint64_t>(count) * 16));
+    std::vector<uint8_t> code(length);
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(processHandle_, reinterpret_cast<LPCVOID>(address), code.data(),
+        code.size(), &read) || !read) return 0;
+    const auto quote = [](std::wstring* json, const std::wstring& value) {
+        const wchar_t digits[] = L"0123456789abcdef";
+        *json += L'"';
+        for (wchar_t ch : value) {
+            if (ch == L'"' || ch == L'\\') { *json += L'\\'; *json += ch; }
+            else if (ch < 0x20) {
+                *json += L"\\u00"; *json += digits[(ch >> 4) & 15]; *json += digits[ch & 15];
+            } else *json += ch;
+        }
+        *json += L'"';
+    };
+    std::wstring json = L"{\"address\":" + std::to_wstring(address) + L",\"instructions\":[";
+    const uint8_t mode = DetermineDisassemblyModeBits(processHandle_);
+    size_t offset = 0;
+    for (uint32_t i = 0; i < count && offset < read; ++i) {
+        const DecodedInstruction decoded = DecodeInstruction(address + offset,
+            code.data() + offset, read - offset, mode);
+        const size_t size = (std::max)(size_t(1), (std::min)(decoded.length, read - offset));
+        if (i) json += L',';
+        json += L"{\"address\":" + std::to_wstring(address + offset) +
+            L",\"size\":" + std::to_wstring(size) + L",\"bytes\":";
+        quote(&json, BytesToHex(code.data() + offset, size));
+        json += L",\"text\":";
+        quote(&json, RewriteImportedThunkSymbols(decoded.text));
+        json += L'}';
+        offset += size;
+    }
+    json += L"],\"architecture_bits\":" + std::to_wstring(mode) + L'}';
+    if (json.size() >= outJsonChars) return 0;
+    wcscpy_s(outJson, outJsonChars, json.c_str());
+    return 1;
+}
+
+int32_t Debugger::DebuggerApiGetManagementListJson(uint32_t kind, wchar_t* outJson, uint32_t outJsonChars) const {
+    if (!outJson || !outJsonChars || kind > 4) return 0;
+    std::wstring json = L"{\"items\":[";
+    const auto quote = [](std::wstring* target, const std::wstring& value) {
+        *target += L'"';
+        const wchar_t hex[] = L"0123456789abcdef";
+        for (wchar_t ch : value) {
+            if (ch == L'"' || ch == L'\\') { *target += L'\\'; *target += ch; }
+            else if (ch < 0x20) {
+                *target += L"\\u00";
+                *target += hex[(ch >> 4) & 15];
+                *target += hex[ch & 15];
+            } else *target += ch;
+        }
+        *target += L'"';
+    };
+    const auto comma = [&json]() { if (json.back() != L'[') json += L','; };
+    if (kind == 0) {
+        for (const auto& entry : namedSnapshots_) {
+            comma();
+            json += L"{\"name\":";
+            quote(&json, entry.first);
+            json += L",\"instruction_pointer\":" + std::to_wstring(GetInstructionPointer(entry.second.stop.context)) +
+                L",\"thread_id\":" + std::to_wstring(entry.second.stop.threadId) + L'}';
+        }
+    } else if (kind == 1) {
+        for (const auto& root : sourceRoots_) { comma(); quote(&json, root); }
+    } else if (kind == 2) {
+        std::vector<size_t> lines(scriptBreakpoints_.begin(), scriptBreakpoints_.end());
+        std::sort(lines.begin(), lines.end());
+        for (size_t line : lines) { comma(); json += std::to_wstring(line); }
+    } else if (kind == 3) {
+        const ExceptionRuleSet* rules[] = {&debuggingExceptionRules_, &runtimeExceptionRules_, &steppingExceptionRules_};
+        for (uint32_t scope = 0; scope < _countof(rules); ++scope) {
+            comma();
+            json += L"{\"scope\":" + std::to_wstring(scope) +
+                L",\"ignore_all\":" + (rules[scope]->ignoreAll ? L"true" : L"false") + L",\"codes\":[";
+            std::vector<DWORD> codes(rules[scope]->ignoredCodes.begin(), rules[scope]->ignoredCodes.end());
+            std::sort(codes.begin(), codes.end());
+            for (DWORD code : codes) { if (json.back() != L'[') json += L','; json += std::to_wstring(code); }
+            json += L"]}";
+        }
+    } else {
+        for (size_t i = 0; i < runStopExpressions_.size(); ++i) {
+            comma();
+            json += L"{\"index\":" + std::to_wstring(i + 1) + L",\"expression\":";
+            quote(&json, runStopExpressions_[i]);
+            json += L'}';
+        }
+    }
+    json += L"]}";
+    if (json.size() >= outJsonChars) return 0;
+    wcsncpy_s(outJson, outJsonChars, json.c_str(), _TRUNCATE);
+    return 1;
 }
 
 bool Debugger::QueryThreadTeb(DWORD tid, uint64_t& teb) const {
@@ -21404,6 +21588,8 @@ void PrintColoredHelpLine(const wchar_t* rawLine) {
 void Debugger::PrintHelp() const {
     EnsureConsoleColorEnabled();
     PrintColoredHelpLine(L"Commands:\n");
+    PrintColoredHelpLine(L"  /font [8-24]                            Show or set terminal font height in pixels\n");
+    PrintColoredHelpLine(L"  /spacing [0-16]                         Show or set output line spacing in pixels\n");
     PrintColoredHelpLine(L"  z0dbgcli --py <file>                    Run a Python script after GUI init\n");
     PrintColoredHelpLine(L"  z0dbgcli --pyexec <code>                Run inline Python after GUI init\n");
     PrintColoredHelpLine(L"  launch <exe> [args...]                  Launch and break at main-module entry point\n");
