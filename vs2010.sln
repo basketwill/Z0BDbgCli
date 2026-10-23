@@ -1,7 +1,7 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.14.36401.2 d17.14
+VisualStudioVersion = 17.14.36401.2
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Z0BDbgCli", "BuildVS2010\WinDbgLiteCli.vcxproj", "{500055F0-681E-4480-B3EC-31C16E7D45F0}"
 	ProjectSection(ProjectDependencies) = postProject

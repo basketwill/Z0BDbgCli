@@ -1107,6 +1107,134 @@ static std::wstring CanonicalizePathBestEffort(const std::wstring& value) {
     return std::wstring(buffer.data(), copied);
 }
 
+std::wstring QuoteCommandLineArgument(const std::wstring& value) {
+    if (value.empty()) {
+        return L"\"\"";
+    }
+    bool needsQuotes = false;
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (std::iswspace(value[i]) || value[i] == L'"') {
+            needsQuotes = true;
+            break;
+        }
+    }
+    if (!needsQuotes) {
+        return value;
+    }
+
+    std::wstring out = L"\"";
+    size_t backslashes = 0;
+    for (size_t i = 0; i < value.size(); ++i) {
+        const wchar_t ch = value[i];
+        if (ch == L'\\') {
+            ++backslashes;
+            continue;
+        }
+        if (ch == L'"') {
+            out.append(backslashes * 2 + 1, L'\\');
+            out.push_back(ch);
+            backslashes = 0;
+            continue;
+        }
+        if (backslashes != 0) {
+            out.append(backslashes, L'\\');
+            backslashes = 0;
+        }
+        out.push_back(ch);
+    }
+    if (backslashes != 0) {
+        out.append(backslashes * 2, L'\\');
+    }
+    out.push_back(L'"');
+    return out;
+}
+
+std::wstring EscapeToolRepositoryField(const std::wstring& value) {
+    std::wstring out;
+    out.reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i) {
+        const wchar_t ch = value[i];
+        if (ch == L'\\') {
+            out += L"\\\\";
+        } else if (ch == L'\t') {
+            out += L"\\t";
+        } else if (ch == L'\r') {
+            out += L"\\r";
+        } else if (ch == L'\n') {
+            out += L"\\n";
+        } else {
+            out.push_back(ch);
+        }
+    }
+    return out;
+}
+
+std::wstring UnescapeToolRepositoryField(const std::wstring& value) {
+    std::wstring out;
+    out.reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] != L'\\' || i + 1 >= value.size()) {
+            out.push_back(value[i]);
+            continue;
+        }
+        const wchar_t next = value[++i];
+        if (next == L't') out.push_back(L'\t');
+        else if (next == L'r') out.push_back(L'\r');
+        else if (next == L'n') out.push_back(L'\n');
+        else out.push_back(next);
+    }
+    return out;
+}
+
+std::vector<std::wstring> SplitTabSeparatedFields(const std::wstring& line) {
+    std::vector<std::wstring> fields;
+    size_t start = 0;
+    while (start <= line.size()) {
+        const size_t tab = line.find(L'\t', start);
+        fields.push_back(UnescapeToolRepositoryField(
+            tab == std::wstring::npos ? line.substr(start) : line.substr(start, tab - start)));
+        if (tab == std::wstring::npos) {
+            break;
+        }
+        start = tab + 1;
+    }
+    return fields;
+}
+
+bool StartExternalToolProcess(const std::wstring& commandLine) {
+    if (TrimWhitespace(commandLine).empty()) {
+        return false;
+    }
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+    mutableCommand.push_back(L'\0');
+
+    STARTUPINFOW si = STARTUPINFOW();
+    PROCESS_INFORMATION pi = PROCESS_INFORMATION();
+    si.cb = sizeof(si);
+    const BOOL ok = CreateProcessW(
+        nullptr,
+        mutableCommand.data(),
+        nullptr,
+        nullptr,
+        TRUE,
+        0,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+    if (!ok) {
+        std::wcout << L"CreateProcessW failed: " << GetLastError() << L"\n";
+        return false;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    std::wcout << L"Tool process exited with code " << exitCode << L".\n";
+    return exitCode == 0;
+}
+
 std::vector<std::wstring> SplitPathSegments(const std::wstring& path) {
     std::vector<std::wstring> segments;
     const std::wstring normalized = NormalizePathSeparators(path);
@@ -2345,6 +2473,7 @@ Debugger::Debugger(const std::wstring& tracePath)
       stepOverBreakpointId_(-1),
       nextBreakpointId_(1),
       nextPluginId_(1),
+      nextToolRepositoryId_(1),
       pluginEventDispatchActive_(false),
       activePluginDispatchIndex_(-1),
       eventPumpThreadHandle_(NULL),
@@ -2423,6 +2552,9 @@ Debugger::Debugger(const std::wstring& tracePath)
     debuggerApi_.getBreakpointCount = &Debugger::DebuggerApiGetBreakpointCountThunk;
     debuggerApi_.getBreakpointInfo = &Debugger::DebuggerApiGetBreakpointInfoThunk;
     debuggerApi_.executeCommand = &Debugger::DebuggerApiExecuteCommandThunk;
+    debuggerApi_.getManagementListJson = &Debugger::DebuggerApiGetManagementListJsonThunk;
+    debuggerApi_.executeCommandWithOutput = &Debugger::DebuggerApiExecuteCommandWithOutputThunk;
+    debuggerApi_.disassembleJson = &Debugger::DebuggerApiDisassembleJsonThunk;
     symbolCacheDirectory_ = QueryDefaultSymbolCacheDirectory();
     symbolServerUrl_ = L"https://msdl.microsoft.com/download/symbols";
     EnsureConsoleColorEnabled();
@@ -14313,6 +14445,23 @@ int32_t WDBL_CALL Debugger::DebuggerApiExecuteCommandThunk(void* context, const 
     return debugger != nullptr ? debugger->DebuggerApiExecuteCommand(command) : 0;
 }
 
+int32_t WDBL_CALL Debugger::DebuggerApiGetManagementListJsonThunk(void* context, uint32_t kind, wchar_t* outJson, uint32_t outJsonChars) {
+    auto* debugger = static_cast<Debugger*>(context);
+    return debugger != nullptr ? debugger->DebuggerApiGetManagementListJson(kind, outJson, outJsonChars) : 0;
+}
+
+int32_t WDBL_CALL Debugger::DebuggerApiExecuteCommandWithOutputThunk(void* context, const wchar_t* command,
+    wchar_t* outText, uint32_t outTextChars, int32_t* outTruncated) {
+    auto* debugger = static_cast<Debugger*>(context);
+    return debugger != nullptr ? debugger->DebuggerApiExecuteCommandWithOutput(command, outText, outTextChars, outTruncated) : 0;
+}
+
+int32_t WDBL_CALL Debugger::DebuggerApiDisassembleJsonThunk(void* context, uint64_t address,
+    uint32_t count, wchar_t* outJson, uint32_t outJsonChars) {
+    auto* debugger = static_cast<Debugger*>(context);
+    return debugger ? debugger->DebuggerApiDisassembleJson(address, count, outJson, outJsonChars) : 0;
+}
+
 void Debugger::PluginHostLog(const wchar_t* text) {
     if (text == nullptr || text[0] == L'\0') {
         return;
@@ -14347,6 +14496,7 @@ int32_t Debugger::PluginHostGetStopInfo(WdblStopInfo* outInfo) const {
     }
     WdblStopInfo info = WdblStopInfo();
     info.size = sizeof(WdblStopInfo);
+    EnterCriticalSection(const_cast<CRITICAL_SECTION*>(&stateLock_));
     if (pendingEvent_.valid && stopState_.valid) {
         info.paused = 1;
         info.processId = stopState_.processId;
@@ -14357,6 +14507,7 @@ int32_t Debugger::PluginHostGetStopInfo(WdblStopInfo* outInfo) const {
         info.instructionPointer = GetInstructionPointer(stopState_.context);
         CopyWideText(info.reason, stopState_.reason);
     }
+    LeaveCriticalSection(const_cast<CRITICAL_SECTION*>(&stateLock_));
     *outInfo = info;
     return 1;
 }
@@ -14644,6 +14795,7 @@ int32_t Debugger::DebuggerApiUndoMemoryPatch(uint32_t count) const {
 }
 
 int32_t Debugger::DebuggerApiSaveCurrentStopSnapshot() const {
+    if (!pendingEvent_.valid || !stopState_.valid) return 0;
     const_cast<Debugger*>(this)->SaveCurrentStopSnapshot();
     return 1;
 }
@@ -14955,6 +15107,167 @@ int32_t Debugger::DebuggerApiExecuteCommand(const wchar_t* command) {
         return 0;
     }
     return ExecuteCommand(tokens, false) ? 1 : 0;
+}
+
+int32_t Debugger::DebuggerApiExecuteCommandWithOutput(const wchar_t* command, wchar_t* outText,
+    uint32_t outTextChars, int32_t* outTruncated) {
+    if (!outText || outTextChars == 0 || !outTruncated) return 0;
+    outText[0] = L'\0';
+    *outTruncated = 0;
+    static SRWLOCK captureLock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&captureLock);
+    struct ReleaseCaptureLock {
+        SRWLOCK* lock;
+        ~ReleaseCaptureLock() { ReleaseSRWLockExclusive(lock); }
+    } releaseLock = {&captureLock};
+    class CaptureBuffer : public std::wstreambuf {
+    public:
+        CaptureBuffer(std::wstreambuf* destination, size_t capacity)
+            : destination_(destination), capacity_(capacity), thread_(GetCurrentThreadId()), truncated_(false) {}
+        const std::wstring& output() const { return output_; }
+        bool truncated() const { return truncated_; }
+    protected:
+        std::streamsize xsputn(const wchar_t* text, std::streamsize count) override {
+            if (GetCurrentThreadId() == thread_ && count > 0) {
+                const size_t available = capacity_ - output_.size();
+                const size_t copied = (std::min)(available, static_cast<size_t>(count));
+                output_.append(text, copied);
+                if (copied < static_cast<size_t>(count)) truncated_ = true;
+            }
+            return destination_->sputn(text, count);
+        }
+        int_type overflow(int_type value) override {
+            if (traits_type::eq_int_type(value, traits_type::eof())) return traits_type::not_eof(value);
+            const wchar_t ch = traits_type::to_char_type(value);
+            if (GetCurrentThreadId() == thread_) {
+                if (output_.size() < capacity_) output_ += ch;
+                else truncated_ = true;
+            }
+            return destination_->sputc(ch);
+        }
+        int sync() override { return destination_->pubsync(); }
+    private:
+        std::wstreambuf* destination_;
+        size_t capacity_;
+        DWORD thread_;
+        std::wstring output_;
+        bool truncated_;
+    };
+    std::wcout.flush();
+    CaptureBuffer capture(std::wcout.rdbuf(), outTextChars - 1);
+    struct RestoreBuffer {
+        std::wstreambuf* original;
+        ~RestoreBuffer() { std::wcout.rdbuf(original); }
+    } restore = {std::wcout.rdbuf(&capture)};
+    const int32_t success = DebuggerApiExecuteCommand(command);
+    std::wcout.flush();
+    wcsncpy_s(outText, outTextChars, capture.output().c_str(), _TRUNCATE);
+    *outTruncated = capture.truncated() ? 1 : 0;
+    return success;
+}
+
+int32_t Debugger::DebuggerApiDisassembleJson(uint64_t address, uint32_t count,
+    wchar_t* outJson, uint32_t outJsonChars) const {
+    if (!outJson || !outJsonChars || !processHandle_ || !address || count < 1 || count > 64) return 0;
+    outJson[0] = L'\0';
+    MEMORY_BASIC_INFORMATION region = {};
+    if (!VirtualQueryEx(processHandle_, reinterpret_cast<LPCVOID>(address), &region, sizeof(region)) ||
+        region.State != MEM_COMMIT || !IsReadableProtection(region.Protect)) return 0;
+    const uint64_t end = reinterpret_cast<uint64_t>(region.BaseAddress) + region.RegionSize;
+    if (end <= address) return 0;
+    const size_t length = static_cast<size_t>((std::min)(end - address,
+        static_cast<uint64_t>(count) * 16));
+    std::vector<uint8_t> code(length);
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(processHandle_, reinterpret_cast<LPCVOID>(address), code.data(),
+        code.size(), &read) || !read) return 0;
+    const auto quote = [](std::wstring* json, const std::wstring& value) {
+        const wchar_t digits[] = L"0123456789abcdef";
+        *json += L'"';
+        for (wchar_t ch : value) {
+            if (ch == L'"' || ch == L'\\') { *json += L'\\'; *json += ch; }
+            else if (ch < 0x20) {
+                *json += L"\\u00"; *json += digits[(ch >> 4) & 15]; *json += digits[ch & 15];
+            } else *json += ch;
+        }
+        *json += L'"';
+    };
+    std::wstring json = L"{\"address\":" + std::to_wstring(address) + L",\"instructions\":[";
+    const uint8_t mode = DetermineDisassemblyModeBits(processHandle_);
+    size_t offset = 0;
+    for (uint32_t i = 0; i < count && offset < read; ++i) {
+        const DecodedInstruction decoded = DecodeInstruction(address + offset,
+            code.data() + offset, read - offset, mode);
+        const size_t size = (std::max)(size_t(1), (std::min)(decoded.length, read - offset));
+        if (i) json += L',';
+        json += L"{\"address\":" + std::to_wstring(address + offset) +
+            L",\"size\":" + std::to_wstring(size) + L",\"bytes\":";
+        quote(&json, BytesToHex(code.data() + offset, size));
+        json += L",\"text\":";
+        quote(&json, RewriteImportedThunkSymbols(decoded.text));
+        json += L'}';
+        offset += size;
+    }
+    json += L"],\"architecture_bits\":" + std::to_wstring(mode) + L'}';
+    if (json.size() >= outJsonChars) return 0;
+    wcscpy_s(outJson, outJsonChars, json.c_str());
+    return 1;
+}
+
+int32_t Debugger::DebuggerApiGetManagementListJson(uint32_t kind, wchar_t* outJson, uint32_t outJsonChars) const {
+    if (!outJson || !outJsonChars || kind > 4) return 0;
+    std::wstring json = L"{\"items\":[";
+    const auto quote = [](std::wstring* target, const std::wstring& value) {
+        *target += L'"';
+        const wchar_t hex[] = L"0123456789abcdef";
+        for (wchar_t ch : value) {
+            if (ch == L'"' || ch == L'\\') { *target += L'\\'; *target += ch; }
+            else if (ch < 0x20) {
+                *target += L"\\u00";
+                *target += hex[(ch >> 4) & 15];
+                *target += hex[ch & 15];
+            } else *target += ch;
+        }
+        *target += L'"';
+    };
+    const auto comma = [&json]() { if (json.back() != L'[') json += L','; };
+    if (kind == 0) {
+        for (const auto& entry : namedSnapshots_) {
+            comma();
+            json += L"{\"name\":";
+            quote(&json, entry.first);
+            json += L",\"instruction_pointer\":" + std::to_wstring(GetInstructionPointer(entry.second.stop.context)) +
+                L",\"thread_id\":" + std::to_wstring(entry.second.stop.threadId) + L'}';
+        }
+    } else if (kind == 1) {
+        for (const auto& root : sourceRoots_) { comma(); quote(&json, root); }
+    } else if (kind == 2) {
+        std::vector<size_t> lines(scriptBreakpoints_.begin(), scriptBreakpoints_.end());
+        std::sort(lines.begin(), lines.end());
+        for (size_t line : lines) { comma(); json += std::to_wstring(line); }
+    } else if (kind == 3) {
+        const ExceptionRuleSet* rules[] = {&debuggingExceptionRules_, &runtimeExceptionRules_, &steppingExceptionRules_};
+        for (uint32_t scope = 0; scope < _countof(rules); ++scope) {
+            comma();
+            json += L"{\"scope\":" + std::to_wstring(scope) +
+                L",\"ignore_all\":" + (rules[scope]->ignoreAll ? L"true" : L"false") + L",\"codes\":[";
+            std::vector<DWORD> codes(rules[scope]->ignoredCodes.begin(), rules[scope]->ignoredCodes.end());
+            std::sort(codes.begin(), codes.end());
+            for (DWORD code : codes) { if (json.back() != L'[') json += L','; json += std::to_wstring(code); }
+            json += L"]}";
+        }
+    } else {
+        for (size_t i = 0; i < runStopExpressions_.size(); ++i) {
+            comma();
+            json += L"{\"index\":" + std::to_wstring(i + 1) + L",\"expression\":";
+            quote(&json, runStopExpressions_[i]);
+            json += L'}';
+        }
+    }
+    json += L"]}";
+    if (json.size() >= outJsonChars) return 0;
+    wcsncpy_s(outJson, outJsonChars, json.c_str(), _TRUNCATE);
+    return 1;
 }
 
 bool Debugger::QueryThreadTeb(DWORD tid, uint64_t& teb) const {
@@ -15671,6 +15984,326 @@ void Debugger::AutoLoadPluginModules() {
 
         FindClose(findHandle);
     }
+}
+
+ToolRepositoryItem* Debugger::FindToolRepositoryItem(const std::wstring& token) {
+    const std::wstring key = ToLower(TrimWhitespace(token));
+    if (key.empty()) {
+        return nullptr;
+    }
+    uint64_t idValue = 0;
+    const bool byId = ParseUInt64(key[0] == L'#' ? key.substr(1) : key, idValue);
+    for (auto it = toolRepository_.begin(); it != toolRepository_.end(); ++it) {
+        if ((byId && static_cast<uint64_t>(it->id) == idValue) || ToLower(it->name) == key) {
+            return &(*it);
+        }
+    }
+    return nullptr;
+}
+
+const ToolRepositoryItem* Debugger::FindToolRepositoryItem(const std::wstring& token) const {
+    const std::wstring key = ToLower(TrimWhitespace(token));
+    if (key.empty()) {
+        return nullptr;
+    }
+    uint64_t idValue = 0;
+    const bool byId = ParseUInt64(key[0] == L'#' ? key.substr(1) : key, idValue);
+    for (auto it = toolRepository_.begin(); it != toolRepository_.end(); ++it) {
+        if ((byId && static_cast<uint64_t>(it->id) == idValue) || ToLower(it->name) == key) {
+            return &(*it);
+        }
+    }
+    return nullptr;
+}
+
+bool Debugger::AddToolRepositoryItem(
+    const std::wstring& name,
+    const std::wstring& kind,
+    const std::wstring& path,
+    const std::wstring& defaultArgs,
+    const std::wstring& description) {
+    const std::wstring itemName = ToLower(TrimWhitespace(name));
+    const std::wstring itemKind = ToLower(TrimWhitespace(kind));
+    if (itemName.empty() || itemName.find_first_of(L" \t\r\n") != std::wstring::npos) {
+        std::wcout << L"Tool name cannot be empty or contain whitespace.\n";
+        return false;
+    }
+    if (itemKind != L"py" && itemKind != L"exe" && itemKind != L"plugin" &&
+        itemKind != L"script" && itemKind != L"cmd") {
+        std::wcout << L"Tool kind must be py, exe, plugin, script, or cmd.\n";
+        return false;
+    }
+    const std::wstring trimmedPath = TrimWhitespace(path);
+    if (trimmedPath.empty()) {
+        std::wcout << L"Tool path cannot be empty.\n";
+        return false;
+    }
+
+    ToolRepositoryItem* existing = FindToolRepositoryItem(itemName);
+    if (existing != nullptr) {
+        existing->kind = itemKind;
+        existing->path = itemKind == L"cmd" ? trimmedPath : CanonicalizePathBestEffort(trimmedPath);
+        existing->defaultArgs = defaultArgs;
+        existing->description = description;
+        std::wcout << L"Updated tool: " << existing->name << L"\n";
+        return true;
+    }
+
+    ToolRepositoryItem item = ToolRepositoryItem();
+    item.id = nextToolRepositoryId_++;
+    item.name = itemName;
+    item.kind = itemKind;
+    item.path = itemKind == L"cmd" ? trimmedPath : CanonicalizePathBestEffort(trimmedPath);
+    item.defaultArgs = defaultArgs;
+    item.description = description;
+    toolRepository_.push_back(item);
+    std::wcout << L"Added tool #" << item.id << L": " << item.name << L" (" << item.kind << L")\n";
+    return true;
+}
+
+bool Debugger::RemoveToolRepositoryItem(const std::wstring& token) {
+    const std::wstring key = ToLower(TrimWhitespace(token));
+    if (key.empty()) {
+        std::wcout << L"Usage: arsenal remove <id|name|*>\n";
+        return false;
+    }
+    if (key == L"*") {
+        const size_t count = toolRepository_.size();
+        toolRepository_.clear();
+        std::wcout << L"Removed " << count << L" tool(s).\n";
+        return true;
+    }
+    uint64_t idValue = 0;
+    const bool byId = ParseUInt64(key[0] == L'#' ? key.substr(1) : key, idValue);
+    for (auto it = toolRepository_.begin(); it != toolRepository_.end(); ++it) {
+        if ((byId && static_cast<uint64_t>(it->id) == idValue) || ToLower(it->name) == key) {
+            std::wcout << L"Removed tool: " << it->name << L"\n";
+            toolRepository_.erase(it);
+            return true;
+        }
+    }
+    std::wcout << L"Tool not found: " << token << L"\n";
+    return false;
+}
+
+void Debugger::ClearToolRepository() {
+    const size_t count = toolRepository_.size();
+    toolRepository_.clear();
+    std::wcout << L"Cleared " << count << L" tool(s).\n";
+}
+
+void Debugger::ListToolRepository() const {
+    std::wcout << L"--- Tool Repository ---\n";
+    if (toolRepository_.empty()) {
+        std::wcout << L"(none)\n";
+        return;
+    }
+    for (auto it = toolRepository_.begin(); it != toolRepository_.end(); ++it) {
+        std::wcout << L"[#" << it->id << L"] " << it->name
+                   << L" kind=" << it->kind
+                   << L" path=" << it->path;
+        if (!it->defaultArgs.empty()) {
+            std::wcout << L" args=" << it->defaultArgs;
+        }
+        if (!it->description.empty()) {
+            std::wcout << L" - " << it->description;
+        }
+        std::wcout << L"\n";
+    }
+}
+
+bool Debugger::RunToolRepositoryItem(const std::wstring& token, const std::wstring& args) {
+    const ToolRepositoryItem* item = FindToolRepositoryItem(token);
+    if (item == nullptr) {
+        std::wcout << L"Tool not found: " << token << L"\n";
+        return false;
+    }
+
+    std::wstring mergedArgs = TrimWhitespace(item->defaultArgs);
+    const std::wstring extraArgs = TrimWhitespace(args);
+    if (!extraArgs.empty()) {
+        if (!mergedArgs.empty()) {
+            mergedArgs += L" ";
+        }
+        mergedArgs += extraArgs;
+    }
+
+    if (item->kind == L"plugin") {
+        if (!LoadPluginModule(item->path)) {
+            return false;
+        }
+        if (mergedArgs.empty()) {
+            return true;
+        }
+        const PluginModule* loaded = nullptr;
+        const std::wstring loweredPath = ToLower(CanonicalizePathBestEffort(item->path));
+        for (auto it = pluginModules_.begin(); it != pluginModules_.end(); ++it) {
+            if (ToLower(it->path) == loweredPath) {
+                loaded = &(*it);
+                break;
+            }
+        }
+        return loaded != nullptr && ExecutePluginModule(loaded->name, mergedArgs);
+    }
+    if (item->kind == L"script") {
+        if (!LoadScriptFile(item->path)) {
+            return false;
+        }
+        if (!mergedArgs.empty()) {
+            scriptVariables_[L"args"] = mergedArgs;
+        }
+        return true;
+    }
+    if (item->kind == L"py") {
+        std::wstring commandLine = L"python.exe " + QuoteCommandLineArgument(item->path);
+        if (!mergedArgs.empty()) {
+            commandLine += L" " + mergedArgs;
+        }
+        return StartExternalToolProcess(commandLine);
+    }
+    if (item->kind == L"cmd") {
+        std::wstring commandLine = L"cmd.exe /c " + item->path;
+        if (!mergedArgs.empty()) {
+            commandLine += L" " + mergedArgs;
+        }
+        return StartExternalToolProcess(commandLine);
+    }
+
+    std::wstring commandLine = QuoteCommandLineArgument(item->path);
+    if (!mergedArgs.empty()) {
+        commandLine += L" " + mergedArgs;
+    }
+    return StartExternalToolProcess(commandLine);
+}
+
+bool Debugger::SaveToolRepository(const std::wstring& filePath) const {
+    const std::wstring path = TrimWhitespace(filePath).empty()
+        ? L"wdbl_tool_repository.txt"
+        : TrimWhitespace(filePath);
+    std::wstringstream out;
+    out << L"WinDbgLite Tool Repository\n";
+    out << L"# name\tkind\tpath\tdefault_args\tdescription\n";
+    for (auto it = toolRepository_.begin(); it != toolRepository_.end(); ++it) {
+        out << EscapeToolRepositoryField(it->name) << L"\t"
+            << EscapeToolRepositoryField(it->kind) << L"\t"
+            << EscapeToolRepositoryField(it->path) << L"\t"
+            << EscapeToolRepositoryField(it->defaultArgs) << L"\t"
+            << EscapeToolRepositoryField(it->description) << L"\n";
+    }
+    std::wstring error;
+    if (!WriteWideTextUtf8File(path, out.str(), error)) {
+        std::wcout << L"Failed to save tool repository: " << error << L"\n";
+        return false;
+    }
+    std::wcout << L"Tool repository saved to: " << path << L"\n";
+    return true;
+}
+
+bool Debugger::LoadToolRepository(const std::wstring& filePath) {
+    const std::wstring path = TrimWhitespace(filePath).empty()
+        ? L"wdbl_tool_repository.txt"
+        : TrimWhitespace(filePath);
+    std::wstring text;
+    if (!ReadTextFileToWide(path, text)) {
+        std::wcout << L"Failed to read tool repository: " << path << L"\n";
+        return false;
+    }
+
+    std::vector<ToolRepositoryItem> loaded;
+    int nextId = 1;
+    std::wistringstream input(text);
+    std::wstring line;
+    while (std::getline(input, line)) {
+        line = TrimWhitespace(line);
+        if (line.empty() || line[0] == L'#' || line == L"WinDbgLite Tool Repository") {
+            continue;
+        }
+        if (line.rfind(L"\uFEFF", 0) == 0) {
+            line = TrimWhitespace(line.substr(1));
+            if (line.empty() || line[0] == L'#' || line == L"WinDbgLite Tool Repository") {
+                continue;
+            }
+        }
+        const std::vector<std::wstring> fields = SplitTabSeparatedFields(line);
+        if (fields.size() < 3) {
+            continue;
+        }
+        const std::wstring name = ToLower(TrimWhitespace(fields[0]));
+        const std::wstring kind = ToLower(TrimWhitespace(fields[1]));
+        if (name.empty() || kind.empty()) {
+            continue;
+        }
+        ToolRepositoryItem item = ToolRepositoryItem();
+        item.id = nextId++;
+        item.name = name;
+        item.kind = kind;
+        item.path = fields[2];
+        if (fields.size() >= 4) {
+            item.defaultArgs = fields[3];
+        }
+        if (fields.size() >= 5) {
+            item.description = fields[4];
+        }
+        loaded.push_back(item);
+    }
+
+    toolRepository_.swap(loaded);
+    nextToolRepositoryId_ = nextId;
+    std::wcout << L"Tool repository loaded: " << toolRepository_.size() << L" tool(s).\n";
+    return true;
+}
+
+bool Debugger::ExecuteToolRepositoryCommand(const std::vector<std::wstring>& tokens) {
+    if (tokens.size() < 2) {
+        std::wcout << L"Usage: arsenal <list|add|remove|clear|run|save|load> ...\n";
+        return false;
+    }
+    const std::wstring action = ToLower(tokens[1]);
+    if (action == L"list" || action == L"ls") {
+        ListToolRepository();
+        return true;
+    }
+    if (action == L"add") {
+        if (tokens.size() < 5) {
+            std::wcout << L"Usage: arsenal add <name> <py|exe|plugin|script|cmd> <path> [default_args...]\n";
+            return false;
+        }
+        return AddToolRepositoryItem(tokens[2], tokens[3], tokens[4], tokens.size() > 5 ? JoinTokens(tokens, 5) : L"", L"");
+    }
+    if (action == L"remove" || action == L"del" || action == L"rm") {
+        if (tokens.size() != 3) {
+            std::wcout << L"Usage: arsenal remove <id|name|*>\n";
+            return false;
+        }
+        return RemoveToolRepositoryItem(tokens[2]);
+    }
+    if (action == L"clear") {
+        ClearToolRepository();
+        return true;
+    }
+    if (action == L"run" || action == L"exec") {
+        if (tokens.size() < 3) {
+            std::wcout << L"Usage: arsenal run <id|name> [args...]\n";
+            return false;
+        }
+        return RunToolRepositoryItem(tokens[2], tokens.size() > 3 ? JoinTokens(tokens, 3) : L"");
+    }
+    if (action == L"save") {
+        if (tokens.size() > 3) {
+            std::wcout << L"Usage: arsenal save [file]\n";
+            return false;
+        }
+        return SaveToolRepository(tokens.size() == 3 ? tokens[2] : L"");
+    }
+    if (action == L"load") {
+        if (tokens.size() > 3) {
+            std::wcout << L"Usage: arsenal load [file]\n";
+            return false;
+        }
+        return LoadToolRepository(tokens.size() == 3 ? tokens[2] : L"");
+    }
+    std::wcout << L"Unknown arsenal action.\n";
+    return false;
 }
 
 const wchar_t kWinDbgLiteMemDriverServiceName[] = L"WinDbgLiteMemDrv";
@@ -20855,155 +21488,255 @@ bool Debugger::ExecuteCommand(const std::vector<std::wstring>& tokens, bool from
         PrintModuleInfo();
         return true;
     }
+    if (cmd == L"arsenal" || cmd == L"toolrepo" || cmd == L"tools" || cmd == L"weapon") {
+        return ExecuteToolRepositoryCommand(tokens);
+    }
 
     std::wcout << L"Unknown command. Use 'help'.\n";
     return false;
 }
 
+namespace {
+const wchar_t* kHelpCommandColor = L"[38;2;86;156;214m";
+const wchar_t* kHelpParamColor = L"[38;2;206;145;120m";
+const wchar_t* kHelpTextColor = L"[37m";
+const wchar_t* kHelpResetColor = L"[0m";
+
+void WriteAnsiColor(const wchar_t* code) {
+    std::wcout << wchar_t(0x1b) << code;
+}
+
+void WriteHelpPart(const std::wstring& text, const wchar_t* color) {
+    if (text.empty()) {
+        return;
+    }
+    WriteAnsiColor(color);
+    std::wcout << text;
+    WriteAnsiColor(kHelpResetColor);
+}
+
+size_t FindHelpDescriptionStart(const std::wstring& line) {
+    for (size_t i = 2; i + 1 < line.size(); ++i) {
+        if (line[i] == L' ' && line[i + 1] == L' ') {
+            size_t end = i + 2;
+            while (end < line.size() && line[end] == L' ') {
+                ++end;
+            }
+            if (end < line.size()) {
+                return i;
+            }
+        }
+    }
+    return std::wstring::npos;
+}
+
+size_t FindHelpParameterStart(const std::wstring& spec) {
+    size_t result = std::wstring::npos;
+    const size_t angle = spec.find(L'<');
+    if (angle != std::wstring::npos) {
+        result = angle;
+    }
+    const size_t bracket = spec.find(L'[');
+    if (bracket != std::wstring::npos && (result == std::wstring::npos || bracket < result)) {
+        result = bracket;
+    }
+    const size_t dash = spec.find(L" -");
+    if (dash != std::wstring::npos && (result == std::wstring::npos || dash + 1 < result)) {
+        result = dash + 1;
+    }
+    return result;
+}
+
+void PrintColoredHelpLine(const wchar_t* rawLine) {
+    std::wstring line(rawLine != nullptr ? rawLine : L"");
+    while (!line.empty() && (line[line.size() - 1] == L'\n' || line[line.size() - 1] == L'\r')) {
+        line.resize(line.size() - 1);
+    }
+    if (line.empty()) {
+        std::wcout << L"\n";
+        return;
+    }
+    if (line.size() < 3 || line[0] != L' ' || line[1] != L' ') {
+        WriteHelpPart(line, kHelpTextColor);
+        std::wcout << L"\n";
+        return;
+    }
+
+    const size_t descStart = FindHelpDescriptionStart(line);
+    const std::wstring left = descStart == std::wstring::npos ? line : line.substr(0, descStart);
+    const std::wstring right = descStart == std::wstring::npos ? L"" : line.substr(descStart);
+    if (left.find_first_not_of(L' ') == std::wstring::npos) {
+        WriteHelpPart(line, kHelpTextColor);
+        std::wcout << L"\n";
+        return;
+    }
+
+    std::wcout << L"  ";
+    const std::wstring spec = left.substr(2);
+    const size_t paramStart = FindHelpParameterStart(spec);
+    if (paramStart == std::wstring::npos) {
+        WriteHelpPart(spec, kHelpCommandColor);
+    } else {
+        WriteHelpPart(spec.substr(0, paramStart), kHelpCommandColor);
+        WriteHelpPart(spec.substr(paramStart), kHelpParamColor);
+    }
+    WriteHelpPart(right, kHelpTextColor);
+    std::wcout << L"\n";
+}
+}  // namespace
+
 void Debugger::PrintHelp() const {
-    std::wcout << L"Commands:\n";
-    std::wcout << L"  z0dbgcli --py <file>                    Run a Python script after GUI init\n";
-    std::wcout << L"  z0dbgcli --pyexec <code>                Run inline Python after GUI init\n";
-    std::wcout << L"  launch <exe> [args...]                  Launch and break at main-module entry point\n";
-    std::wcout << L"  .attach|attach <pid>                    Attach debugger to process\n";
-    std::wcout << L"  .detach|detach                          Detach debugger from attached process\n";
-    std::wcout << L"  drv <on|off|status|caps|antidebug|dr|handles|threadinfo|image|mitigations|events|events follow>\n";
-    std::wcout << L"  veh <on|off|detach|kill|status> [pid]   Control VEH agent framework\n";
-    std::wcout << L"  veh launch <exe> [args...]              Launch a process under VEH agent mode\n";
-    std::wcout << L"  veh break                               Interrupt the VEH target process\n";
-    std::wcout << L"  veh refresh                             Refresh VEH module/thread snapshot\n";
-    std::wcout << L"  veh modules|threads                     Show VEH-synced module/thread cache\n";
-    std::wcout << L"  veh read <addr> [size]                  Read memory through VEH agent\n";
-    std::wcout << L"  veh write <addr> <byte...>              Write memory through VEH agent\n";
-    std::wcout << L"  veh ctx <tid> | setreg <tid> <reg> <v>  Get/set thread context through VEH agent\n";
-    std::wcout << L"  veh suspend|resume <tid>                Suspend/resume thread through VEH agent\n";
-    std::wcout << L"  veh ex <bp|search|continue> [code]      Set VEH exception forwarding policy\n";
-    std::wcout << L"  run | g                                 Continue execution\n";
-    std::wcout << L"  step | si | t                           Single instruction step (step into)\n";
-    std::wcout << L"  p | stepover | so                       Step over call/rep/loop/int\n";
-    std::wcout << L"  gu                                      Go up until current function returns\n";
-    std::wcout << L"  wt [max_steps]                          Trace/watch execution timing\n";
-    std::wcout << L"  stepback|reverse|sbk [count]            Restore previous paused snapshot(s)\n";
-    std::wcout << L"  debugback|dbk [count]                   Alias for stepback\n";
-    std::wcout << L"  runtoentry|rte                          Run and break at main-module entry point\n";
-    std::wcout << L"  snapshot|snap <save|restore|rerun|list|clear> [name]\n";
-    std::wcout << L"  savesnap|snapsave [name]                Save current paused snapshot by name\n";
-    std::wcout << L"  rerunsnap|snaprerun [name]              Restore snapshot and continue execution\n";
-    std::wcout << L"  flow|cfg [address] [max_blocks]         Show textual control-flow graph\n";
-    std::wcout << L"  stepuntil|traceuntil|tu <cond> [max]    Step until condition is met\n";
-    std::wcout << L"  rununtil|pauseuntil|ru <cond> [max]     Continue/pause until condition is met\n";
-    std::wcout << L"  autostep|astep <count> [delay_ms]       Automatic repeated single-step\n";
-    std::wcout << L"  autorun|arun <cycles> [delay_ms]        Automatic repeated continue-to-pause\n";
-    std::wcout << L"  break|bp <address|api|module!api|module+offset>\n";
-    std::wcout << L"  bu <symbol|module!symbol|module+offset>  Set deferred software breakpoint\n";
-    std::wcout << L"  hw|hr|he <addr>                         Set hardware write/read-access/execute breakpoint\n";
-    std::wcout << L"  hbreak|hbp <slot> <addr> <type> <len> [tid|all]\n";
-    std::wcout << L"                                           type: exec|write|access, len: 1|2|4|8\n";
-    std::wcout << L"  hc|hclear <id|*>                        Delete hardware breakpoint(s)\n";
-    std::wcout << L"  mbreak|mbp <addr> <size> <access>       Set memory guard breakpoint\n";
-    std::wcout << L"                                           access: r|w|x|rw|rx|wx|rwx\n";
-    std::wcout << L"  bl                                      List breakpoints\n";
-    std::wcout << L"  be <id> | bd <id> | bc <id|*>           Enable/disable/delete breakpoint(s)\n";
-    std::wcout << L"  bcond <id> <condition>                  Set breakpoint condition expression\n";
-    std::wcout << L"  bcond clear <id>                        Clear breakpoint condition\n";
-    std::wcout << L"                                           vars: hit tid ip addr; ops: == != > >= < <=; use &&\n";
-    std::wcout << L"  excfg|exshow                            Show exception ignore/run-stop settings\n";
-    std::wcout << L"  exignore all <scope> <on|off>           Toggle ignore-all exceptions in scope\n";
-    std::wcout << L"  exignore add|del <scope> <code>         Manage ignored exception codes\n";
-    std::wcout << L"  exignore clear <scope>                  Clear ignored exception code list\n";
-    std::wcout << L"                                           scope: debug|run|step; code: hex or aliases (av,bp,ss,guard)\n";
-    std::wcout << L"  exstop add|del|list|clear               Manage run-stop expression breakpoints\n";
-    std::wcout << L"  eb|ew|ed|eq <addr> <value>              Write byte/word/dword/qword memory value\n";
-    std::wcout << L"  eza|ezu <addr> <string>                 Write null-terminated ASCII/Unicode string\n";
-    std::wcout << L"  patch|poke <addr> <byte...>             Patch target process memory bytes\n";
-    std::wcout << L"  patch list [max_items]                  Show patch history (latest first)\n";
-    std::wcout << L"  patch undo [count|*]                    Revert recent patch operations\n";
-    std::wcout << L"  patchstr|ps <addr> <ascii|utf16> <txt>  Patch text bytes into target memory\n";
-    std::wcout << L"  patchfile|pf <addr> <file> [off] [sz]   Patch bytes loaded from a file slice\n";
-    std::wcout << L"  patchfile|pf preview <file> [off] [sz]  Preview bytes from a file slice\n";
-    std::wcout << L"  nop <addr> <count>                      Patch count bytes with 0x90 NOP\n";
-    std::wcout << L"  plugin|plug list                        List loaded plugin modules\n";
-    std::wcout << L"  plugin|plug autoload                    Load all plugin DLLs from default plugin folders\n";
-    std::wcout << L"  plugin|plug load <dll_path>             Load plugin module DLL\n";
-    std::wcout << L"  plugin|plug enable <id|name>            Enable a loaded plugin module\n";
-    std::wcout << L"  plugin|plug disable <id|name>           Disable a loaded plugin module\n";
-    std::wcout << L"  plugin|plug unload <id|name|*>          Unload plugin module(s)\n";
-    std::wcout << L"  plugin|plug run <id|name> [args...]     Execute a loaded plugin module\n";
-    std::wcout << L"  !process|process                        Show process information\n";
-    std::wcout << L"  processes|ps                            List processes\n";
-    std::wcout << L"  !thread                                 Show current thread information and stack\n";
-    std::wcout << L"  threads                                 Show thread information\n";
-    std::wcout << L"  ~ | ~* | ~*s | ~*k | ~<index>s         List/switch threads, show all stacks\n";
-    std::wcout << L"  !vm                                     Show virtual memory status\n";
-    std::wcout << L"  vmmap|memmap                            Show process memory regions\n";
-    std::wcout << L"  vad                                     Scan suspicious VAD-like regions\n";
-    std::wcout << L"  vad dump <index|0xaddress> <file>       Dump one committed memory region\n";
-    std::wcout << L"  iatcheck [module|all]                   Check imported function pointers\n";
-    std::wcout << L"  modifycheck [module|all]                Compare selected module/API bytes\n";
-    std::wcout << L"  syscallcheck [module]                   Check ntdll syscall stubs against disk\n";
-    std::wcout << L"  threadcheck                             Check thread start/current addresses\n";
-    std::wcout << L"  analysis report                         Summarize anti-debug/VAD/thread checks\n";
-    std::wcout << L"  timeline [max]                          Show driver events and debugger stop\n";
-    std::wcout << L"  timeline follow [interval_ms]           Follow the unified event timeline\n";
-    std::wcout << L"  exceptioncheck                          Check SEH and exception dispatcher integrity\n";
-    std::wcout << L"  modulecheck                             Check loaded module headers and mappings\n";
-    std::wcout << L"  report export <file> [txt|json]         Export an analysis summary\n";
-    std::wcout << L"  apitrace [max] [filter]                 Show driver-backed API behavior events\n";
-    std::wcout << L"  modules | lm [m <filter>]               Show loaded modules\n";
-    std::wcout << L"  .sympath|sympath [path]                 Show/set symbol search path\n";
-    std::wcout << L"  symfix [cache_dir] [server_url]         Configure symbol server path\n";
-    std::wcout << L"  .reload|symreload [*|module|address]    Reload symbols from path\n";
-    std::wcout << L"  symdownload|symdl [*|module|address]    Download and load PDB symbols\n";
-    std::wcout << L"  x <module!symbol-mask>                  Examine symbols\n";
-    std::wcout << L"  srcroot <add|del|list|clear> [path]     Manage source localization roots\n";
-    std::wcout << L"  srcwhere                                Show current IP source location\n";
-    std::wcout << L"  srcat <address> [context_lines]         Show source around address\n";
-    std::wcout << L"  srcbp <file> <line>                     Set source-level breakpoint\n";
-    std::wcout << L"  srcresolve|srcr <file> <line>           Resolve source location to address\n";
-    std::wcout << L"  scriptload|sload <file>                 Load custom debugger script\n";
-    std::wcout << L"  scriptshow|sshow                         Show script with cursor/breakpoints\n";
-    std::wcout << L"  scriptrun|scriptstart|srun              Run script until end/breakpoint\n";
-    std::wcout << L"  scriptstep|sstep                         Execute one script line\n";
-    std::wcout << L"  scriptuntil|srunto <label>               Run script until label is reached\n";
-    std::wcout << L"  scriptbp|sbp <line>                      Set script breakpoint on source line\n";
-    std::wcout << L"  scriptbd|sbd <line>                      Remove script breakpoint\n";
-    std::wcout << L"  scriptbl|sbl                             List script breakpoints\n";
-    std::wcout << L"  scriptset|sset <name> <value>            Set script variable\n";
-    std::wcout << L"  scriptunset <name>                       Remove script variable\n";
-    std::wcout << L"  scriptvars|svars                         Show script variables\n";
-    std::wcout << L"  scriptreset|sreset                       Reset script cursor to start\n";
-    std::wcout << L"  scriptclear|sclear                       Clear loaded script state\n";
-    std::wcout << L"  envsave|savesettings [file_path]         Save current runtime environment snapshot\n";
-    std::wcout << L"  envload|loadsettings [file_path]         Load runtime environment snapshot\n";
-    std::wcout << L"  exception                               Show exception information\n";
-    std::wcout << L"  r [mmx|float|debug|reg=value] [--ui]    Show or modify CPU registers\n";
-    std::wcout << L"  regs                                    Alias for r\n";
-    std::wcout << L"  asm color <on|off|status>               Toggle disassembly color output\n";
-    std::wcout << L"  disasm|u|uf [address|api|module!api|module+offset] [count]\n";
-    std::wcout << L"  pc|pseudoc|decompile [address|symbol] [count] [--ui] [--features]  Minimal pseudo C\n";
-    std::wcout << L"  comment|cmt <add|set|del|show|list> ... Manage instruction comments\n";
-    std::wcout << L"  k|kb|kv [max_frames] [--ui]             Show stack trace\n";
-    std::wcout << L"  stack [max_frames] [--ui]               Show stack contents\n";
-    std::wcout << L"  !peb|peb                                Show process environment block details\n";
-    std::wcout << L"  !teb|teb                                Show current thread environment block details\n";
-    std::wcout << L"  seh                                     Show SEH/exception chain details\n";
-    std::wcout << L"  handles [max|all]                       Show process handle information\n";
-    std::wcout << L"  memstr [min_len] [max]                  Scan memory strings\n";
-    std::wcout << L"  s -a|-u <text> | -b <byte...> | -d <value> | -q <value>\n";
-    std::wcout << L"  search                                  Alias for s\n";
-    std::wcout << L"  db|dw|dd|dq <addr> [bytes] [per_line] [--ui] Dump memory as byte/word/dword/qword\n";
-    std::wcout << L"  da <addr> [bytes] [--ui]                Display ASCII memory\n";
-    std::wcout << L"  dt <type|module!type> <addr> [depth]    Display structure fields and values\n";
-    std::wcout << L"  dump <file> [base_address length]       Dump current exe or a custom memory range to file\n";
-    std::wcout << L"  .writemem <file> <addr> L<size>         Save target memory range to file\n";
-    std::wcout << L"  .dvalloc <size>                         Allocate virtual memory in target process\n";
-    std::wcout << L"  membin|mbin <address> <size>            Show memory as binary bytes\n";
-    std::wcout << L"  context|ctx                             Show key debug context views\n";
-    std::wcout << L"  py help                                 Show Python bridge help\n";
-    std::wcout << L"  py run <file>                           Run a Python script file\n";
-    std::wcout << L"  py exec <code>                          Execute Python code\n";
-    std::wcout << L"  help                                    Show this help\n";
-    std::wcout << L"  quit|exit                               Exit debugger\n";
+    EnsureConsoleColorEnabled();
+    PrintColoredHelpLine(L"Commands:\n");
+    PrintColoredHelpLine(L"  /font [8-24]                            Show or set terminal font height in pixels\n");
+    PrintColoredHelpLine(L"  /spacing [0-16]                         Show or set output line spacing in pixels\n");
+    PrintColoredHelpLine(L"  z0dbgcli --py <file>                    Run a Python script after GUI init\n");
+    PrintColoredHelpLine(L"  z0dbgcli --pyexec <code>                Run inline Python after GUI init\n");
+    PrintColoredHelpLine(L"  launch <exe> [args...]                  Launch and break at main-module entry point\n");
+    PrintColoredHelpLine(L"  .attach|attach <pid>                    Attach debugger to process\n");
+    PrintColoredHelpLine(L"  .detach|detach                          Detach debugger from attached process\n");
+    PrintColoredHelpLine(L"  drv <on|off|status|caps|antidebug|dr|handles|threadinfo|image|mitigations|events|events follow>\n");
+    PrintColoredHelpLine(L"  veh <on|off|detach|kill|status> [pid]   Control VEH agent framework\n");
+    PrintColoredHelpLine(L"  veh launch <exe> [args...]              Launch a process under VEH agent mode\n");
+    PrintColoredHelpLine(L"  veh break                               Interrupt the VEH target process\n");
+    PrintColoredHelpLine(L"  veh refresh                             Refresh VEH module/thread snapshot\n");
+    PrintColoredHelpLine(L"  veh modules|threads                     Show VEH-synced module/thread cache\n");
+    PrintColoredHelpLine(L"  veh read <addr> [size]                  Read memory through VEH agent\n");
+    PrintColoredHelpLine(L"  veh write <addr> <byte...>              Write memory through VEH agent\n");
+    PrintColoredHelpLine(L"  veh ctx <tid> | setreg <tid> <reg> <v>  Get/set thread context through VEH agent\n");
+    PrintColoredHelpLine(L"  veh suspend|resume <tid>                Suspend/resume thread through VEH agent\n");
+    PrintColoredHelpLine(L"  veh ex <bp|search|continue> [code]      Set VEH exception forwarding policy\n");
+    PrintColoredHelpLine(L"  run | g                                 Continue execution\n");
+    PrintColoredHelpLine(L"  step | si | t                           Single instruction step (step into)\n");
+    PrintColoredHelpLine(L"  p | stepover | so                       Step over call/rep/loop/int\n");
+    PrintColoredHelpLine(L"  gu                                      Go up until current function returns\n");
+    PrintColoredHelpLine(L"  wt [max_steps]                          Trace/watch execution timing\n");
+    PrintColoredHelpLine(L"  stepback|reverse|sbk [count]            Restore previous paused snapshot(s)\n");
+    PrintColoredHelpLine(L"  debugback|dbk [count]                   Alias for stepback\n");
+    PrintColoredHelpLine(L"  runtoentry|rte                          Run and break at main-module entry point\n");
+    PrintColoredHelpLine(L"  snapshot|snap <save|restore|rerun|list|clear> [name]\n");
+    PrintColoredHelpLine(L"  savesnap|snapsave [name]                Save current paused snapshot by name\n");
+    PrintColoredHelpLine(L"  rerunsnap|snaprerun [name]              Restore snapshot and continue execution\n");
+    PrintColoredHelpLine(L"  flow|cfg [address] [max_blocks]         Show textual control-flow graph\n");
+    PrintColoredHelpLine(L"  stepuntil|traceuntil|tu <cond> [max]    Step until condition is met\n");
+    PrintColoredHelpLine(L"  rununtil|pauseuntil|ru <cond> [max]     Continue/pause until condition is met\n");
+    PrintColoredHelpLine(L"  autostep|astep <count> [delay_ms]       Automatic repeated single-step\n");
+    PrintColoredHelpLine(L"  autorun|arun <cycles> [delay_ms]        Automatic repeated continue-to-pause\n");
+    PrintColoredHelpLine(L"  break|bp <address|api|module!api|module+offset>\n");
+    PrintColoredHelpLine(L"  bu <symbol|module!symbol|module+offset>  Set deferred software breakpoint\n");
+    PrintColoredHelpLine(L"  hw|hr|he <addr>                         Set hardware write/read-access/execute breakpoint\n");
+    PrintColoredHelpLine(L"  hbreak|hbp <slot> <addr> <type> <len> [tid|all]\n");
+    PrintColoredHelpLine(L"                                           type: exec|write|access, len: 1|2|4|8\n");
+    PrintColoredHelpLine(L"  hc|hclear <id|*>                        Delete hardware breakpoint(s)\n");
+    PrintColoredHelpLine(L"  mbreak|mbp <addr> <size> <access>       Set memory guard breakpoint\n");
+    PrintColoredHelpLine(L"                                           access: r|w|x|rw|rx|wx|rwx\n");
+    PrintColoredHelpLine(L"  bl                                      List breakpoints\n");
+    PrintColoredHelpLine(L"  be <id> | bd <id> | bc <id|*>           Enable/disable/delete breakpoint(s)\n");
+    PrintColoredHelpLine(L"  bcond <id> <condition>                  Set breakpoint condition expression\n");
+    PrintColoredHelpLine(L"  bcond clear <id>                        Clear breakpoint condition\n");
+    PrintColoredHelpLine(L"                                           vars: hit tid ip addr; ops: == != > >= < <=; use &&\n");
+    PrintColoredHelpLine(L"  excfg|exshow                            Show exception ignore/run-stop settings\n");
+    PrintColoredHelpLine(L"  exignore all <scope> <on|off>           Toggle ignore-all exceptions in scope\n");
+    PrintColoredHelpLine(L"  exignore add|del <scope> <code>         Manage ignored exception codes\n");
+    PrintColoredHelpLine(L"  exignore clear <scope>                  Clear ignored exception code list\n");
+    PrintColoredHelpLine(L"                                           scope: debug|run|step; code: hex or aliases (av,bp,ss,guard)\n");
+    PrintColoredHelpLine(L"  exstop add|del|list|clear               Manage run-stop expression breakpoints\n");
+    PrintColoredHelpLine(L"  eb|ew|ed|eq <addr> <value>              Write byte/word/dword/qword memory value\n");
+    PrintColoredHelpLine(L"  eza|ezu <addr> <string>                 Write null-terminated ASCII/Unicode string\n");
+    PrintColoredHelpLine(L"  patch|poke <addr> <byte...>             Patch target process memory bytes\n");
+    PrintColoredHelpLine(L"  patch list [max_items]                  Show patch history (latest first)\n");
+    PrintColoredHelpLine(L"  patch undo [count|*]                    Revert recent patch operations\n");
+    PrintColoredHelpLine(L"  patchstr|ps <addr> <ascii|utf16> <txt>  Patch text bytes into target memory\n");
+    PrintColoredHelpLine(L"  patchfile|pf <addr> <file> [off] [sz]   Patch bytes loaded from a file slice\n");
+    PrintColoredHelpLine(L"  patchfile|pf preview <file> [off] [sz]  Preview bytes from a file slice\n");
+    PrintColoredHelpLine(L"  nop <addr> <count>                      Patch count bytes with 0x90 NOP\n");
+    PrintColoredHelpLine(L"  plugin|plug list                        List loaded plugin modules\n");
+    PrintColoredHelpLine(L"  plugin|plug autoload                    Load all plugin DLLs from default plugin folders\n");
+    PrintColoredHelpLine(L"  plugin|plug load <dll_path>             Load plugin module DLL\n");
+    PrintColoredHelpLine(L"  plugin|plug enable <id|name>            Enable a loaded plugin module\n");
+    PrintColoredHelpLine(L"  plugin|plug disable <id|name>           Disable a loaded plugin module\n");
+    PrintColoredHelpLine(L"  plugin|plug unload <id|name|*>          Unload plugin module(s)\n");
+    PrintColoredHelpLine(L"  plugin|plug run <id|name> [args...]     Execute a loaded plugin module\n");
+    PrintColoredHelpLine(L"  arsenal list                            List local tool repository entries\n");
+    PrintColoredHelpLine(L"  arsenal add <name> <py|exe|plugin|script|cmd> <path> [args]\n");
+    PrintColoredHelpLine(L"  arsenal run <id|name> [args...]         Run/load a repository tool\n");
+    PrintColoredHelpLine(L"  arsenal remove <id|name|*>              Remove repository tool(s)\n");
+    PrintColoredHelpLine(L"  arsenal save|load [file]                Save/load repository file\n");
+    PrintColoredHelpLine(L"  !process|process                        Show process information\n");
+    PrintColoredHelpLine(L"  processes|ps                            List processes\n");
+    PrintColoredHelpLine(L"  !thread                                 Show current thread information and stack\n");
+    PrintColoredHelpLine(L"  threads                                 Show thread information\n");
+    PrintColoredHelpLine(L"  ~ | ~* | ~*s | ~*k | ~<index>s         List/switch threads, show all stacks\n");
+    PrintColoredHelpLine(L"  !vm                                     Show virtual memory status\n");
+    PrintColoredHelpLine(L"  vmmap|memmap                            Show process memory regions\n");
+    PrintColoredHelpLine(L"  vad                                     Scan suspicious VAD-like regions\n");
+    PrintColoredHelpLine(L"  vad dump <index|0xaddress> <file>       Dump one committed memory region\n");
+    PrintColoredHelpLine(L"  iatcheck [module|all]                   Check imported function pointers\n");
+    PrintColoredHelpLine(L"  modifycheck [module|all]                Compare selected module/API bytes\n");
+    PrintColoredHelpLine(L"  syscallcheck [module]                   Check ntdll syscall stubs against disk\n");
+    PrintColoredHelpLine(L"  threadcheck                             Check thread start/current addresses\n");
+    PrintColoredHelpLine(L"  analysis report                         Summarize anti-debug/VAD/thread checks\n");
+    PrintColoredHelpLine(L"  timeline [max]                          Show driver events and debugger stop\n");
+    PrintColoredHelpLine(L"  timeline follow [interval_ms]           Follow the unified event timeline\n");
+    PrintColoredHelpLine(L"  exceptioncheck                          Check SEH and exception dispatcher integrity\n");
+    PrintColoredHelpLine(L"  modulecheck                             Check loaded module headers and mappings\n");
+    PrintColoredHelpLine(L"  report export <file> [txt|json]         Export an analysis summary\n");
+    PrintColoredHelpLine(L"  apitrace [max] [filter]                 Show driver-backed API behavior events\n");
+    PrintColoredHelpLine(L"  modules | lm [m <filter>]               Show loaded modules\n");
+    PrintColoredHelpLine(L"  .sympath|sympath [path]                 Show/set symbol search path\n");
+    PrintColoredHelpLine(L"  symfix [cache_dir] [server_url]         Configure symbol server path\n");
+    PrintColoredHelpLine(L"  .reload|symreload [*|module|address]    Reload symbols from path\n");
+    PrintColoredHelpLine(L"  symdownload|symdl [*|module|address]    Download and load PDB symbols\n");
+    PrintColoredHelpLine(L"  x <module!symbol-mask>                  Examine symbols\n");
+    PrintColoredHelpLine(L"  srcroot <add|del|list|clear> [path]     Manage source localization roots\n");
+    PrintColoredHelpLine(L"  srcwhere                                Show current IP source location\n");
+    PrintColoredHelpLine(L"  srcat <address> [context_lines]         Show source around address\n");
+    PrintColoredHelpLine(L"  srcbp <file> <line>                     Set source-level breakpoint\n");
+    PrintColoredHelpLine(L"  srcresolve|srcr <file> <line>           Resolve source location to address\n");
+    PrintColoredHelpLine(L"  scriptload|sload <file>                 Load custom debugger script\n");
+    PrintColoredHelpLine(L"  scriptshow|sshow                         Show script with cursor/breakpoints\n");
+    PrintColoredHelpLine(L"  scriptrun|scriptstart|srun              Run script until end/breakpoint\n");
+    PrintColoredHelpLine(L"  scriptstep|sstep                         Execute one script line\n");
+    PrintColoredHelpLine(L"  scriptuntil|srunto <label>               Run script until label is reached\n");
+    PrintColoredHelpLine(L"  scriptbp|sbp <line>                      Set script breakpoint on source line\n");
+    PrintColoredHelpLine(L"  scriptbd|sbd <line>                      Remove script breakpoint\n");
+    PrintColoredHelpLine(L"  scriptbl|sbl                             List script breakpoints\n");
+    PrintColoredHelpLine(L"  scriptset|sset <name> <value>            Set script variable\n");
+    PrintColoredHelpLine(L"  scriptunset <name>                       Remove script variable\n");
+    PrintColoredHelpLine(L"  scriptvars|svars                         Show script variables\n");
+    PrintColoredHelpLine(L"  scriptreset|sreset                       Reset script cursor to start\n");
+    PrintColoredHelpLine(L"  scriptclear|sclear                       Clear loaded script state\n");
+    PrintColoredHelpLine(L"  envsave|savesettings [file_path]         Save current runtime environment snapshot\n");
+    PrintColoredHelpLine(L"  envload|loadsettings [file_path]         Load runtime environment snapshot\n");
+    PrintColoredHelpLine(L"  exception                               Show exception information\n");
+    PrintColoredHelpLine(L"  r [mmx|float|debug|reg=value] [--ui]    Show or modify CPU registers\n");
+    PrintColoredHelpLine(L"  regs                                    Alias for r\n");
+    PrintColoredHelpLine(L"  asm color <on|off|status>               Toggle disassembly color output\n");
+    PrintColoredHelpLine(L"  disasm|u|uf [address|api|module!api|module+offset] [count]\n");
+    PrintColoredHelpLine(L"  pc|pseudoc|decompile [address|symbol] [count] [--ui] [--features]  Minimal pseudo C\n");
+    PrintColoredHelpLine(L"  comment|cmt <add|set|del|show|list> ... Manage instruction comments\n");
+    PrintColoredHelpLine(L"  k|kb|kv [max_frames] [--ui]             Show stack trace\n");
+    PrintColoredHelpLine(L"  stack [max_frames] [--ui]               Show stack contents\n");
+    PrintColoredHelpLine(L"  !peb|peb                                Show process environment block details\n");
+    PrintColoredHelpLine(L"  !teb|teb                                Show current thread environment block details\n");
+    PrintColoredHelpLine(L"  seh                                     Show SEH/exception chain details\n");
+    PrintColoredHelpLine(L"  handles [max|all]                       Show process handle information\n");
+    PrintColoredHelpLine(L"  memstr [min_len] [max]                  Scan memory strings\n");
+    PrintColoredHelpLine(L"  s -a|-u <text> | -b <byte...> | -d <value> | -q <value>\n");
+    PrintColoredHelpLine(L"  search                                  Alias for s\n");
+    PrintColoredHelpLine(L"  db|dw|dd|dq <addr> [bytes] [per_line] [--ui] Dump memory as byte/word/dword/qword\n");
+    PrintColoredHelpLine(L"  da <addr> [bytes] [--ui]                Display ASCII memory\n");
+    PrintColoredHelpLine(L"  dt <type|module!type> <addr> [depth]    Display structure fields and values\n");
+    PrintColoredHelpLine(L"  dump <file> [base_address length]       Dump current exe or a custom memory range to file\n");
+    PrintColoredHelpLine(L"  .writemem <file> <addr> L<size>         Save target memory range to file\n");
+    PrintColoredHelpLine(L"  .dvalloc <size>                         Allocate virtual memory in target process\n");
+    PrintColoredHelpLine(L"  membin|mbin <address> <size>            Show memory as binary bytes\n");
+    PrintColoredHelpLine(L"  context|ctx                             Show key debug context views\n");
+    PrintColoredHelpLine(L"  py help                                 Show Python bridge help\n");
+    PrintColoredHelpLine(L"  py run <file>                           Run a Python script file\n");
+    PrintColoredHelpLine(L"  py exec <code>                          Execute Python code\n");
+    PrintColoredHelpLine(L"  help                                    Show this help\n");
+    PrintColoredHelpLine(L"  quit|exit                               Exit debugger\n");
 }
 
 std::wstring Debugger::ToLower(std::wstring value) {

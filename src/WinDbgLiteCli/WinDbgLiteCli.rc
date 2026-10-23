@@ -2,3 +2,6 @@
 
 IDI_APP_ICON ICON "console.ico"
 IDI_LEFT_ICON ICON "lefticon.ico"
+
+#define WDBL_AGENT_EMBEDDED
+#include "agent/source/McpServer.rc"

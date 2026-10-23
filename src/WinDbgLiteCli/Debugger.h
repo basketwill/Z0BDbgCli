@@ -256,6 +256,18 @@ struct PluginModule {
           onEvent(NULL) {}
 };
 
+struct ToolRepositoryItem {
+    int id;
+    std::wstring name;
+    std::wstring kind;
+    std::wstring path;
+    std::wstring defaultArgs;
+    std::wstring description;
+
+    ToolRepositoryItem()
+        : id(0) {}
+};
+
 struct MemoryPatchRecord {
     uint64_t address;
     std::vector<uint8_t> originalBytes;
@@ -550,9 +562,24 @@ private:
     bool ExecutePluginModule(const std::wstring& token, const std::wstring& args);
     bool SetPluginModuleEnabled(const std::wstring& token, bool enabled);
     void AutoLoadPluginModules();
+    bool AddToolRepositoryItem(
+        const std::wstring& name,
+        const std::wstring& kind,
+        const std::wstring& path,
+        const std::wstring& defaultArgs,
+        const std::wstring& description);
+    bool RemoveToolRepositoryItem(const std::wstring& token);
+    void ClearToolRepository();
+    void ListToolRepository() const;
+    bool RunToolRepositoryItem(const std::wstring& token, const std::wstring& args);
+    bool SaveToolRepository(const std::wstring& filePath) const;
+    bool LoadToolRepository(const std::wstring& filePath);
+    bool ExecuteToolRepositoryCommand(const std::vector<std::wstring>& tokens);
 
     PluginModule* FindPluginModule(const std::wstring& token);
     const PluginModule* FindPluginModule(const std::wstring& token) const;
+    ToolRepositoryItem* FindToolRepositoryItem(const std::wstring& token);
+    const ToolRepositoryItem* FindToolRepositoryItem(const std::wstring& token) const;
     static void WDBL_CALL PluginHostLogThunk(void* context, const wchar_t* text);
     static int32_t WDBL_CALL PluginHostExecuteThunk(void* context, const wchar_t* command);
     static int32_t WDBL_CALL PluginHostGetStopInfoThunk(void* context, WdblStopInfo* outInfo);
@@ -619,6 +646,9 @@ private:
     static int32_t WDBL_CALL DebuggerApiGetBreakpointCountThunk(void* context, uint32_t* outCount);
     static int32_t WDBL_CALL DebuggerApiGetBreakpointInfoThunk(void* context, uint32_t index, WdblBreakpointInfo* outInfo);
     static int32_t WDBL_CALL DebuggerApiExecuteCommandThunk(void* context, const wchar_t* command);
+    static int32_t WDBL_CALL DebuggerApiGetManagementListJsonThunk(void* context, uint32_t kind, wchar_t* outJson, uint32_t outJsonChars);
+    static int32_t WDBL_CALL DebuggerApiExecuteCommandWithOutputThunk(void* context, const wchar_t* command, wchar_t* outText, uint32_t outTextChars, int32_t* outTruncated);
+    static int32_t WDBL_CALL DebuggerApiDisassembleJsonThunk(void* context, uint64_t address, uint32_t count, wchar_t* outJson, uint32_t outJsonChars);
     void PluginHostLog(const wchar_t* text);
     int32_t PluginHostExecute(const wchar_t* command);
     int32_t PluginHostGetStopInfo(WdblStopInfo* outInfo) const;
@@ -685,6 +715,9 @@ private:
     int32_t DebuggerApiGetBreakpointCount(uint32_t* outCount) const;
     int32_t DebuggerApiGetBreakpointInfo(uint32_t index, WdblBreakpointInfo* outInfo) const;
     int32_t DebuggerApiExecuteCommand(const wchar_t* command);
+    int32_t DebuggerApiGetManagementListJson(uint32_t kind, wchar_t* outJson, uint32_t outJsonChars) const;
+    int32_t DebuggerApiExecuteCommandWithOutput(const wchar_t* command, wchar_t* outText, uint32_t outTextChars, int32_t* outTruncated);
+    int32_t DebuggerApiDisassembleJson(uint64_t address, uint32_t count, wchar_t* outJson, uint32_t outJsonChars) const;
     void DispatchPluginEvent(const WdblPluginEvent& eventData);
     static std::wstring ModulePathFromBase(uint64_t moduleBase, DWORD processId);
     bool QueryThreadTeb(DWORD tid, uint64_t& teb) const;
@@ -783,7 +816,9 @@ private:
     ExceptionRuleSet steppingExceptionRules_;
     std::vector<std::wstring> runStopExpressions_;
     std::vector<PluginModule> pluginModules_;
+    std::vector<ToolRepositoryItem> toolRepository_;
     int nextPluginId_;
+    int nextToolRepositoryId_;
     bool pluginEventDispatchActive_;
     int activePluginDispatchIndex_;
     std::map<std::wstring, StopSnapshot> namedSnapshots_;

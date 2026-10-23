@@ -29,17 +29,19 @@
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <CharacterSet>Unicode</CharacterSet>
+    <PlatformToolset>v142</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
+    <PlatformToolset>v142</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
     <OutDir>$(ProjectDir)..\..\..\BuildVS2010\Build\Bin\$(Configuration)\$(Platform)\</OutDir>
-    <IntDir>$(ProjectDir)_obj\$(Configuration)\$(Platform)\</IntDir>
+    <IntDir>$(ProjectDir)_obj\$(Configuration)\$(Platform)\$(PlatformToolset)\</IntDir>
     <TargetName>Z0BDbgMcpBridge</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">

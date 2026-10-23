@@ -4533,13 +4533,13 @@ static ZyanStatus ZydisPopulateRegisterIds(ZydisDecoderContext* context,
         id_reg   |= (context->vector_unified.R4 << 4) | (context->vector_unified.R3 << 3);
         id_rm    |= (rm4                        << 4) | (context->vector_unified.B3 << 3);
         id_vvvv  |= (context->vector_unified.V4 << 4)                                    ;
-        id_base  |= (context->vector_unified.B4 << 4) | (context->vector_unified.B3 << 3);
+        id_base  |= (context->vector_unified.B4 << 4) | (context->vector_unif
+   ied.B3 << 3);
         id_index |= (index4                     << 4) | (context->vector_unified.X3 << 3);
 
         // The masking emulates the actual CPU behavior and does not verify if the resulting ids
         // are actually valid for the given register kind.
-
-        const ZyanU8 non_gpr_mask = (ZyanU8)(1 << (is_rex2 ? 4 : 5)) - 1;
+     const ZyanU8 non_gpr_mask = (ZyanU8)(1 << (is_rex2 ? 4 : 5)) - 1;
 
         const ZyanU8 mask_reg[ZYDIS_REGKIND_MAX_VALUE + 1] =
         {

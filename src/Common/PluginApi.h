@@ -10,7 +10,7 @@
 #endif
 
 const uint32_t WDBL_PLUGIN_API_VERSION = 2u;
-const uint32_t WDBL_DEBUGGER_API_VERSION = 11u;
+const uint32_t WDBL_DEBUGGER_API_VERSION = 14u;
 
 struct WdblPluginInfo {
     uint32_t size;
@@ -417,6 +417,9 @@ struct WdblDebuggerApi {
     int32_t (WDBL_CALL* unregisterVmDisasmProvider)(void* context, const wchar_t* name, void* providerContext);
     int32_t (WDBL_CALL* registerPluginCommand)(void* context, const wchar_t* name, const wchar_t* description, WdblPluginCommandFn callback, void* commandContext);
     int32_t (WDBL_CALL* unregisterPluginCommand)(void* context, const wchar_t* name, void* commandContext);
+    int32_t (WDBL_CALL* getManagementListJson)(void* context, uint32_t kind, wchar_t* outJson, uint32_t outJsonChars);
+    int32_t (WDBL_CALL* executeCommandWithOutput)(void* context, const wchar_t* command, wchar_t* outText, uint32_t outTextChars, int32_t* outTruncated);
+    int32_t (WDBL_CALL* disassembleJson)(void* context, uint64_t address, uint32_t count, wchar_t* outJson, uint32_t outJsonChars);
 
     WdblDebuggerApi()
         : size(sizeof(WdblDebuggerApi)),
@@ -487,7 +490,10 @@ struct WdblDebuggerApi {
           registerVmDisasmProvider(NULL),
           unregisterVmDisasmProvider(NULL),
           registerPluginCommand(NULL),
-          unregisterPluginCommand(NULL) {
+          unregisterPluginCommand(NULL),
+          getManagementListJson(NULL),
+          executeCommandWithOutput(NULL),
+          disassembleJson(NULL) {
     }
 };
 
