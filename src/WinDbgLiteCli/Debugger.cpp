@@ -1,4 +1,4 @@
-﻿#include "Debugger.h"
+#include "Debugger.h"
 
 #include <TlHelp32.h>
 #include <Psapi.h>
@@ -22104,22 +22104,22 @@ std::optional<MemoryAccessType> Debugger::ParseMemoryAccess(const std::wstring& 
 
 std::optional<HardwareAccessType> Debugger::ParseHardwareAccess(const std::wstring& value) {
     const std::wstring v = ToLower(value);
-    if (v == L"exec" || v == L"execute" || v == L"x") return HardwareAccessType::Execute;
-    if (v == L"write" || v == L"w") return HardwareAccessType::Write;
-    if (v == L"access" || v == L"rw") return HardwareAccessType::Access;
+    if (v == L"exec" || v == L"execute" || v == L"x") return HardwareAccessType(HardwareAccessType::Execute);
+    if (v == L"write" || v == L"w") return HardwareAccessType(HardwareAccessType::Write);
+    if (v == L"access" || v == L"rw") return HardwareAccessType(HardwareAccessType::Access);
     return std::nullopt;
 }
 
 std::optional<ExceptionScope> Debugger::ParseExceptionScope(const std::wstring& text) {
     const std::wstring v = ToLower(text);
     if (v == L"debug" || v == L"dbg" || v == L"debugging") {
-        return ExceptionScope::Debugging;
+        return ExceptionScope(ExceptionScope::Debugging);
     }
     if (v == L"run" || v == L"runtime") {
-        return ExceptionScope::Runtime;
+        return ExceptionScope(ExceptionScope::Runtime);
     }
     if (v == L"step" || v == L"stepping") {
-        return ExceptionScope::Stepping;
+        return ExceptionScope(ExceptionScope::Stepping);
     }
     return std::nullopt;
 }

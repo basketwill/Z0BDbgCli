@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -111,12 +111,15 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
-      <LanguageStandard>stdcpp14</LanguageStandard>
+      <LanguageStandard>stdcpp11</LanguageStandard>
+      <!-- Modern toolsets (v142/v143) get C++20: required by the real <optional>
+           used in StdCompat.h; a superset of the C++14 the embedded agent needs. -->
+      <LanguageStandard Condition="'$(PlatformToolset)'!='v100'">stdcpp20</LanguageStandard>
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <ExceptionHandling>Sync</ExceptionHandling>
       <RuntimeLibrary Condition="'$(PlatformToolset)'=='v100'">MultiThreadedDebugDLL</RuntimeLibrary>
-      <RuntimeLibrary Condition="'$(PlatformToolset)'!='v100'">MultiThreadedDebug</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(PlatformToolset)'!='v100'">MultiThreadedDebugDLL</RuntimeLibrary>
       <PreprocessorDefinitions Condition="'$(Platform)'=='Win32'">ZYDIS_STATIC_BUILD;ZYCORE_STATIC_BUILD;WDBL_CPP11_COMPAT_CONSOLE=$(WdblCpp11CompatConsole);WIN32;_DEBUG;_CONSOLE;NOMINMAX;WIN32_LEAN_AND_MEAN;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Platform)'=='x64'">ZYDIS_STATIC_BUILD;ZYCORE_STATIC_BUILD;WDBL_CPP11_COMPAT_CONSOLE=$(WdblCpp11CompatConsole);WIN64;_DEBUG;_CONSOLE;NOMINMAX;WIN32_LEAN_AND_MEAN;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\src\Common;..\src\WinDbgLite;..\src\WinDbgLiteCli;..\src;..\third_party\Zydis\include;..\third_party\Zydis\dependencies\zycore\include;..\third_party\Zydis\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -133,14 +136,17 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
-      <LanguageStandard>stdcpp14</LanguageStandard>
+      <LanguageStandard>stdcpp11</LanguageStandard>
+      <!-- Modern toolsets (v142/v143) get C++20: required by the real <optional>
+           used in StdCompat.h; a superset of the C++14 the embedded agent needs. -->
+      <LanguageStandard Condition="'$(PlatformToolset)'!='v100'">stdcpp20</LanguageStandard>
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>false</IntrinsicFunctions>
       <ExceptionHandling>Sync</ExceptionHandling>
       <RuntimeLibrary Condition="'$(PlatformToolset)'=='v100'">MultiThreadedDLL</RuntimeLibrary>
-      <RuntimeLibrary Condition="'$(PlatformToolset)'!='v100'">MultiThreaded</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(PlatformToolset)'!='v100'">MultiThreadedDLL</RuntimeLibrary>
       <PreprocessorDefinitions Condition="'$(Platform)'=='Win32'">ZYDIS_STATIC_BUILD;ZYCORE_STATIC_BUILD;WDBL_CPP11_COMPAT_CONSOLE=$(WdblCpp11CompatConsole);WIN32;NDEBUG;_CONSOLE;NOMINMAX;WIN32_LEAN_AND_MEAN;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Platform)'=='x64'">ZYDIS_STATIC_BUILD;ZYCORE_STATIC_BUILD;WDBL_CPP11_COMPAT_CONSOLE=$(WdblCpp11CompatConsole);WIN64;_WIN64;NDEBUG;_CONSOLE;NOMINMAX;WIN32_LEAN_AND_MEAN;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\src\Common;..\src\WinDbgLite;..\src\WinDbgLiteCli;..\src;..\third_party\Zydis\include;..\third_party\Zydis\dependencies\zycore\include;..\third_party\Zydis\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>

@@ -5,6 +5,7 @@ import json
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import sys
 import threading
@@ -572,7 +573,32 @@ TOOLS.extend([
     {"name": "wdbl_current_thread_info", "description": "Show current thread information.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "wdbl_vm_info", "description": "Show virtual memory status.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "wdbl_memory_map", "description": "Show process memory map.", "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "wdbl_disasm", "description": "Disassemble at an optional address/expression.", "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "count": {"type": "integer"}}}},
+    {
+        "name": "wdbl_disasm",
+        "description": "Disassemble at an address or symbol. Returns plain text (ANSI stripped) by default; set structured=true for instruction objects, raw=true to keep colors.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string"},
+                "count": {"type": "integer", "default": 16, "description": "1..256 instructions"},
+                "structured": {"type": "boolean", "default": False},
+                "raw": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "wdbl_disasm_range",
+        "description": "Disassemble a [start, end) address range in chunks and return structured instruction rows plus plain text. Useful for whole functions without manual continuation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start": {"type": "string"},
+                "end": {"type": "string"},
+                "maxInstructions": {"type": "integer", "default": 512, "description": "1..4096 instructions"},
+            },
+            "required": ["start", "end"],
+        },
+    },
     {"name": "wdbl_flow_graph", "description": "Show textual control-flow graph.", "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "maxBlocks": {"type": "integer"}}}},
     {"name": "wdbl_pseudo_c", "description": "Generate minimal C-like pseudocode for the current function slice.", "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "count": {"type": "integer", "default": 128}, "ui": {"type": "boolean", "default": False}}}},
     {"name": "wdbl_examine_symbols", "description": "Examine symbols by mask, for example kernelbase!*CreateFile*.", "inputSchema": {"type": "object", "properties": {"mask": {"type": "string"}}, "required": ["mask"]}},
@@ -759,6 +785,20 @@ TOOLS.extend([
     {"name": "wdbl_auto_triage", "description": "Capture current context, recommend a read-only skill, optionally run it, and optionally ask the local LLM.", "inputSchema": {"type": "object", "properties": {"executeSkill": {"type": "boolean", "default": True}, "useLlm": {"type": "boolean", "default": False}, "store": {"type": "boolean", "default": True}, "threadIndex": {"type": "integer", "default": 0}, "maxFrames": {"type": "integer", "default": 8}, "limit": {"type": "integer", "default": 5}}}},
     {"name": "wdbl_store_export", "description": "Export local cases, skill runs, LLM notes, events, and debug feature signatures as a JSON bundle.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "includeContext": {"type": "boolean", "default": True}, "limit": {"type": "integer", "default": 500}}}},
     {"name": "wdbl_store_import_cases", "description": "Import cases from a JSON bundle produced by wdbl_store_export.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {
+        "name": "wdbl_ai_brief",
+        "description": "One-call Markdown brief for AI: stop, registers, stack, disassembly at IP, modules, and suggested read-only skills.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "threadIndex": {"type": "integer", "default": 0},
+                "maxFrames": {"type": "integer", "default": 8},
+                "maxModules": {"type": "integer", "default": 8},
+                "limit": {"type": "integer", "default": 5},
+                "includeContext": {"type": "boolean", "default": False},
+            },
+        },
+    },
     {
         "name": "wdbl_model_context",
         "description": "Build the compact context package used for local LLM analysis without calling the model.",
@@ -947,6 +987,144 @@ def execute_capture_text(command: str) -> str:
     return str(response or "")
 
 
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+DISASM_LINE_RE = re.compile(r"^\s*(0x[0-9A-Fa-f]+)\s+((?:[0-9A-Fa-f]{2}\s+)+)(.*)$")
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", str(text or ""))
+
+
+def response_text(response: Any) -> str:
+    if isinstance(response, dict):
+        for key in ("output", "text"):
+            value = response.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+def parse_disasm(text: str) -> list:
+    """Parse the debugger's textual disassembly into address/bytes/text rows."""
+    rows = []
+    for line in strip_ansi(text).splitlines():
+        match = DISASM_LINE_RE.match(line)
+        if not match:
+            continue
+        instruction = match.group(3).strip()
+        if not instruction:
+            continue
+        rows.append({
+            "address": int(match.group(1), 16),
+            "addressHex": match.group(1),
+            "bytes": " ".join(re.findall(r"[0-9A-Fa-f]{2}", match.group(2))),
+            "text": instruction,
+        })
+    return rows
+
+
+def disasm_tool(args: Dict[str, Any]) -> Dict[str, Any]:
+    expression = str(args.get("expression", "") or "").strip()
+    try:
+        count = int(args.get("count", 16) or 16)
+    except Exception:
+        count = 16
+    count = max(1, min(count, 256))
+    command = "u" + ((" " + quote_arg(expression)) if expression else "") + " " + str(count)
+    raw = execute_capture_text(command)
+    plain = strip_ansi(raw)
+    result: Dict[str, Any] = {
+        "ok": True,
+        "command": command,
+        "count": count,
+        "text": plain,
+        "output": plain,
+    }
+    if bool(args.get("structured", False)):
+        result["instructions"] = parse_disasm(plain)
+    if bool(args.get("raw", False)):
+        result["raw"] = raw
+        result["output"] = raw
+        result["text"] = raw
+    return text_result(result)
+
+
+def resolve_address_expression(expression: str) -> int:
+    text = str(expression or "").strip()
+    if not text:
+        return 0
+    # Let the debugger's own expression parser handle symbols, module!symbol,
+    # and its numeric syntax (hex without 0x included).
+    try:
+        response = bridge.request({"cmd": "resolve", "expression": text})
+        if isinstance(response, dict) and response.get("address"):
+            return int(response.get("address"))
+    except Exception:
+        pass
+    try:
+        return int(text, 0)
+    except Exception:
+        return 0
+
+
+def disasm_range_tool(args: Dict[str, Any]) -> Dict[str, Any]:
+    start_expression = str(args.get("start", "") or "").strip()
+    end_expression = str(args.get("end", "") or "").strip()
+    if not start_expression or not end_expression:
+        return text_result({"ok": False, "error": "start and end are required"})
+    start = resolve_address_expression(start_expression)
+    end = resolve_address_expression(end_expression)
+    if not start or not end:
+        return text_result({
+            "ok": False,
+            "error": "cannot resolve start or end expression",
+            "start": start_expression,
+            "end": end_expression,
+        })
+    if end <= start:
+        return text_result({"ok": False, "error": "end must be greater than start", "start": start, "end": end})
+    try:
+        max_instructions = int(args.get("maxInstructions", 512) or 512)
+    except Exception:
+        max_instructions = 512
+    max_instructions = max(1, min(max_instructions, 4096))
+
+    rows = []
+    current = start
+    while current < end and len(rows) < max_instructions:
+        want = min(256, max_instructions - len(rows))
+        text = execute_capture_text("u 0x%X %d" % (current, want))
+        batch = parse_disasm(text)
+        if not batch:
+            break
+        for row in batch:
+            if row["address"] >= end:
+                break
+            rows.append(row)
+        last = batch[-1]
+        next_address = last["address"] + max(1, len(last["bytes"].split()))
+        if next_address <= current:
+            break
+        current = next_address
+        if len(batch) < want:
+            break
+
+    width = 8 if max(start, end) <= 0xFFFFFFFF else 16
+    text = "\n".join(
+        "0x%0*X  %-24s %s" % (width, row["address"], row["bytes"], row["text"]) for row in rows
+    )
+    return text_result({
+        "ok": True,
+        "start": start,
+        "end": end,
+        "count": len(rows),
+        "truncated": len(rows) >= max_instructions and current < end,
+        "instructions": rows,
+        "text": text,
+        "output": text,
+    })
+
+
 def _as_string_list(value: Any) -> Any:
     if isinstance(value, str):
         return [value] if value else []
@@ -1104,6 +1282,23 @@ def capture_debug_context(thread_index: int = 0, max_frames: int = 8, client: Op
             context[key] = active.request(request)
         except Exception as exc:
             context[key] = {"ok": False, "error": str(exc)}
+
+    # A short disassembly window at the current IP makes the AI context package
+    # self-contained without another round trip.
+    stop = context.get("stopInfo")
+    if isinstance(stop, dict):
+        ip = stop.get("instructionPointer") or stop.get("ip")
+        if ip:
+            try:
+                ip_value = int(str(ip), 0)
+            except Exception:
+                ip_value = 0
+            if ip_value:
+                try:
+                    response = active.request({"cmd": "execute_capture", "command": "u 0x%X 10" % ip_value})
+                    context["disasm"] = strip_ansi(response_text(response)).strip()
+                except Exception as exc:
+                    context["disasm"] = ""
     return context
 
 
@@ -1119,6 +1314,106 @@ def normalize_context_for_store(context: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(out.get("stopInfo"), dict):
         out["stopInfo"] = dict(out["stopInfo"])
     return out
+
+
+def _brief_hex(value: Any) -> str:
+    try:
+        return "0x%X" % int(value)
+    except Exception:
+        return str(value or "")
+
+
+def build_ai_brief(
+    context: Dict[str, Any],
+    matches: Optional[list] = None,
+    recommendations: Optional[list] = None,
+    max_frames: int = 8,
+    max_modules: int = 8,
+) -> str:
+    stop = context.get("stopInfo") if isinstance(context.get("stopInfo"), dict) else {}
+    registers = context.get("registers") if isinstance(context.get("registers"), dict) else {}
+    stack = context.get("stack") if isinstance(context.get("stack"), dict) else {}
+    modules = context.get("modules") if isinstance(context.get("modules"), dict) else {}
+    frames = stack.get("frames", []) if isinstance(stack.get("frames"), list) else []
+    module_items = modules.get("modules", []) if isinstance(modules.get("modules"), list) else []
+
+    lines = ["# Debug brief", "", "## Stop"]
+    if stop:
+        lines.append("- reason: `%s`" % (stop.get("reason") or ""))
+        lines.append("- process/thread: `%s` / `%s`" % (stop.get("processId", "?"), stop.get("threadId", "?")))
+        lines.append("- instruction pointer: `%s`" % _brief_hex(stop.get("instructionPointer") or stop.get("ip")))
+        if stop.get("exceptionCode"):
+            lines.append("- exception: `%s` at `%s`" % (
+                _brief_hex(stop.get("exceptionCode")),
+                _brief_hex(stop.get("exceptionAddress")),
+            ))
+    else:
+        lines.append("- (no stop state)")
+
+    if registers:
+        keys = ["rip", "rsp", "rbp", "rax", "rbx", "rcx", "rdx", "rsi", "rdi"] + ["r%d" % i for i in range(8, 16)]
+        pairs = ["%s=%s" % (key, _brief_hex(registers.get(key)))
+                 for key in keys if registers.get(key) is not None]
+        if pairs:
+            lines.extend(["", "## Registers", "`" + "  ".join(pairs) + "`"])
+
+    if frames:
+        lines.extend(["", "## Stack"])
+        for frame in frames[:max_frames]:
+            source = ""
+            if frame.get("sourcePath"):
+                source = " (%s:%s)" % (frame.get("sourcePath"), frame.get("sourceLine", 0))
+            symbol = frame.get("symbol") or ""
+            lines.append(("- #%s `%s` %s%s" % (
+                frame.get("index", "?"),
+                _brief_hex(frame.get("ip")),
+                symbol,
+                source,
+            )).rstrip())
+
+    disasm = context.get("disasm") or ""
+    if disasm:
+        disasm_lines = str(disasm).strip().splitlines()
+        if disasm_lines and disasm_lines[0].startswith("--- Disassembly"):
+            disasm_lines = disasm_lines[1:]
+        lines.extend(["", "## Disassembly at IP", "```asm", "\n".join(disasm_lines).rstrip(), "```"])
+
+    if module_items:
+        lines.extend(["", "## Modules"])
+        seen_modules = set()
+        shown = 0
+        for module in module_items:
+            key = (str(module.get("name", "")).lower(), str(module.get("base", "")))
+            if key in seen_modules:
+                continue
+            seen_modules.add(key)
+            try:
+                size = "0x%X" % int(module.get("size", 0) or 0)
+            except Exception:
+                size = str(module.get("size", ""))
+            lines.append("- `%s` base=%s size=%s" % (
+                module.get("name", "?"),
+                _brief_hex(module.get("base")),
+                size,
+            ))
+            shown += 1
+            if shown >= max_modules:
+                break
+
+    if recommendations:
+        lines.extend(["", "## Suggested skills"])
+        for item in recommendations[:5]:
+            name = item.get("name") or item.get("skill") or "?"
+            reason = item.get("reason") or item.get("description") or ""
+            lines.append("- `%s` %s" % (name, reason))
+
+    if matches:
+        lines.extend(["", "## Similar cases"])
+        for item in matches[:5]:
+            lines.append("- #%s %s" % (item.get("id", "?"), item.get("title", "")))
+
+    lines.extend(["", "> Read-only brief. Prefer read-only commands; do not continue or patch the target based on this alone."])
+    return "\n".join(lines)
 
 
 def make_model_context_package(
@@ -1523,6 +1818,10 @@ def run_skill(skill_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     supplied = args.get("parameters", {})
     if isinstance(supplied, dict):
         parameters.update(supplied)
+    # Allow callers to pass declared skill parameters at the top level as well.
+    for key in skill.get("parameters", {}):
+        if key in args:
+            parameters[key] = args[key]
     for key in ("threadIndex", "maxFrames", "scenario"):
         if key in args:
             parameters[key] = args[key]
@@ -1737,13 +2036,6 @@ def build_execute_command(name: str, args: Dict[str, Any]) -> Optional[str]:
         return command
     if name == "wdbl_driver_on":
         return "drv on" + ((" " + quote_arg(args.get("devicePath"))) if args.get("devicePath") else "")
-    if name == "wdbl_disasm":
-        parts = ["u"]
-        if args.get("expression"):
-            parts.append(quote_arg(args.get("expression")))
-        if args.get("count") is not None:
-            parts.append(str(int(args.get("count", 0))))
-        return " ".join(parts)
     if name == "wdbl_flow_graph":
         parts = ["flow"]
         if args.get("expression"):
@@ -2146,6 +2438,24 @@ def call_tool_impl(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as handle:
             bundle = json.load(handle)
         return text_result({"imported": store.import_cases(bundle)})
+    if name == "wdbl_ai_brief":
+        thread_index = int(args.get("threadIndex", 0))
+        max_frames = int(args.get("maxFrames", 8))
+        limit = int(args.get("limit", 5))
+        context = capture_debug_context(thread_index, max_frames)
+        normalized = normalize_context_for_store(context)
+        matches = store.match_cases(normalized, [], limit)
+        recommendations = recommend_skills_from_triggers(normalized, [], limit)
+        response = {
+            "brief": build_ai_brief(
+                context, matches, recommendations, max_frames, int(args.get("maxModules", 8))
+            ),
+            "matches": matches,
+            "recommendations": recommendations,
+        }
+        if bool(args.get("includeContext", False)):
+            response["context"] = context
+        return text_result(response)
     if name == "wdbl_model_context":
         if isinstance(args.get("context"), dict):
             context = normalize_context_for_store(args.get("context", {}))
@@ -2204,6 +2514,10 @@ def call_tool_impl(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         return text_result({"notes": store.list_llm_notes(int(args.get("limit", 20)))})
     if name == "wdbl_demo_skill":
         return run_demo_skill(args)
+    if name == "wdbl_disasm_range":
+        return disasm_range_tool(args)
+    if name == "wdbl_disasm":
+        return disasm_tool(args)
 
     command = build_execute_command(name, args)
     if command is not None:

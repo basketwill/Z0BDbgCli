@@ -1,4 +1,4 @@
-﻿#include "PythonBridge.h"
+#include "PythonBridge.h"
 
 #include <Windows.h>
 
@@ -1705,7 +1705,7 @@ PyObject* BridgeExecute(PyObject*, PyObject* args) {
 
     PyObject* textObject;
     int captureOutput = 0;
-    if (g_py.PyArg_ParseTuple == nullptr || !g_py.PyArg_ParseTuple(args, "O|p", &textObject, &captureOutput)) {
+    if (g_py.PyArg_ParseTuple == nullptr || !g_py.PyArg_ParseTuple(args, "O|i", &textObject, &captureOutput)) {
         return nullptr;
     }
     std::wstring command;
@@ -1733,7 +1733,7 @@ PyObject* BridgeExecuteCapture(PyObject*, PyObject* args) {
     if (g_py.Py_BuildValue == nullptr) {
         return MakeRuntimeError(L"python api is not available");
     }
-    argv = g_py.Py_BuildValue("Op", textObject, 1);
+    argv = g_py.Py_BuildValue("Oi", textObject, 1);
     if (argv == nullptr) {
         return nullptr;
     }

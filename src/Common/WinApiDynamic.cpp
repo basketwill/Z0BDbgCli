@@ -51,6 +51,12 @@ DWORD g_processMemoryDriverLastError = ERROR_SUCCESS;
 bool g_processDebugDriverActive = false;
 DWORD g_processDebugDriverProcessId = 0;
 
+// Forward declarations: helpers below are referenced from templated wrappers
+// (QueryDriverEnumerationResult / ReadProcessMemoryRange etc.) that appear
+// earlier in this translation unit.
+HANDLE EnsureProcessMemoryDriverHandleLocked();
+void CloseProcessMemoryDriverHandleLocked();
+
 bool IsOpenDriverHandle(HANDLE handle) {
     return handle != nullptr && handle != INVALID_HANDLE_VALUE;
 }
